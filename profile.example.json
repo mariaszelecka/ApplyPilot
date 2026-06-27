@@ -26,15 +26,14 @@
     "available_for_contract": "No"
   },
   "compensation": {
-    "salary_expectation": "85000",
-    "salary_currency": "USD",
-    "salary_range_min": "80000",
-    "salary_range_max": "100000",
-    "currency_conversion_note": ""
+    "salary_expectation": "1",
+    "salary_currency": "CHF",
+    "salary_range_min": "95000",
+    "salary_range_max": "120000"
   },
   "experience": {
-    "years_of_experience_total": "3",
-    "education_level": "Bachelor's Degree",
+    "years_of_experience_total": "5",
+    "education_level": "Master's Degree",
     "current_job_title": "",
     "current_company": "",
     "target_role": "software engineer"
