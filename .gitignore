@@ -18,6 +18,12 @@ logs/
 # MCP configs (per-machine)
 .mcp*.json
 
+# Ad-hoc debug/scratch scripts (repo root only) — often contain hardcoded
+# secrets for quick local testing; never intended to be committed.
+/debug_*.py
+/test_*.py
+/regen_*.py
+
 # Python
 __pycache__/
 *.py[cod]
