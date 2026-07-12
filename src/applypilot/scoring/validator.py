@@ -40,6 +40,13 @@ BANNED_WORDS: list[str] = [
     "furthermore", "additionally", "moreover",
 ]
 
+# Phrases that are ALWAYS an error, regardless of validation_mode -- unlike
+# BANNED_WORDS (which is a warning-only in "normal" mode), these never slip through.
+# "seasoned" alone (substring match) also catches "seasoned professional".
+HARD_BANNED_PHRASES: list[str] = [
+    "seasoned",
+]
+
 LLM_LEAK_PHRASES: list[str] = [
     "i am sorry", "i apologize", "i will try", "let me try",
     "i am at a loss", "i am truly sorry", "apologies for",
@@ -100,7 +107,9 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
-        data:    Parsed JSON from the LLM (title, summary, skills, experience, projects, education).
+        data:    Parsed JSON from the LLM (title, summary, competencies, skills, experience).
+                 Education is code-injected from the profile, not part of the LLM's JSON.
+                 There is no "projects" field -- all real work lives under "experience".
         profile: User profile dict from load_profile().
         mode:    Validation strictness — "strict", "normal", or "lenient".
                  strict  → banned words are errors (trigger retries)
@@ -114,7 +123,7 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    for key in ("title", "summary", "competencies", "skills", "experience"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
     if errors:
@@ -136,30 +145,28 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     resume_facts = profile.get("resume_facts", {})
     preserved_companies = resume_facts.get("preserved_companies", [])
 
+    exp_list = data["experience"] if isinstance(data["experience"], list) else []
+
+    all_exp_headers = [str(e.get("header", "")).lower() for e in exp_list]
+    all_exp_bullets = [str(b).lower() for e in exp_list for b in e.get("bullets", [])]
+    combined_exp_text = " ".join(all_exp_headers + all_exp_bullets)
+
     if isinstance(data["experience"], list):
         for company in preserved_companies:
-            has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
-                for e in data["experience"]
-            )
-            if not has_company:
-                errors.append(f"Company '{company}' missing from experience")
+            # A company may be a plain name or a list of acceptable variants
+            # (e.g. "Credit Suisse" only ever appears as "UBS-CS" in the source resume).
+            variants = company if isinstance(company, list) else [company]
+            if not any(v.lower() in combined_exp_text for v in variants):
+                errors.append(f"Company '{variants[0]}' missing from experience")
         for entry in data["experience"]:
             for b in entry.get("bullets", []):
                 all_text_parts.append(b)
 
-    # Projects: collect bullets
-    if isinstance(data["projects"], list):
-        for entry in data["projects"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
-
-    # Education: preserved school must be present (always enforced)
-    preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school:
-        edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
-            errors.append(f"Education '{preserved_school}' missing")
+    # Job titles must be copied verbatim -- never reworded/reordered (always enforced)
+    preserved_titles = resume_facts.get("preserved_titles", [])
+    for title in preserved_titles:
+        if title.lower() not in combined_exp_text:
+            errors.append(f"Job title '{title}' missing or altered in experience")
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
@@ -168,6 +175,11 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
+
+    # Hard-banned phrases -- always an error regardless of mode, no exceptions.
+    found_hard_banned = [p for p in HARD_BANNED_PHRASES if p in all_text]
+    if found_hard_banned:
+        errors.append(f"Hard-banned phrase: '{found_hard_banned[0]}'")
 
     # Banned filler words — severity depends on mode
     if mode != "lenient":
@@ -202,12 +214,12 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     personal = profile.get("personal", {})
     resume_facts = profile.get("resume_facts", {})
 
-    # 1. Check required sections exist (flexible matching)
+    # 1. Check required sections exist (flexible matching). No PROJECTS section --
+    # all real work lives under EXPERIENCE.
     section_variants: dict[str, list[str]] = {
         "SUMMARY": ["summary", "professional summary", "profile"],
         "TECHNICAL SKILLS": ["technical skills", "skills", "tech stack", "core skills", "technologies"],
         "EXPERIENCE": ["experience", "work experience", "professional experience"],
-        "PROJECTS": ["projects", "personal projects", "key projects", "selected projects"],
         "EDUCATION": ["education", "academic background"],
     }
     for section, variants in section_variants.items():
@@ -221,18 +233,22 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     # 3. Check companies preserved
     for company in resume_facts.get("preserved_companies", []):
-        if company.lower() not in text_lower:
-            errors.append(f"Company '{company}' missing -- cannot remove real experience")
+        variants = company if isinstance(company, list) else [company]
+        if not any(v.lower() in text_lower for v in variants):
+            errors.append(f"Company '{variants[0]}' missing -- cannot remove real experience")
 
-    # 4. Check projects preserved
-    for project in resume_facts.get("preserved_projects", []):
-        if project.lower() not in text_lower:
-            warnings.append(f"Project '{project}' not found -- may have been renamed")
+    # 4b. Check job titles preserved verbatim -- never reworded/reordered
+    for title in resume_facts.get("preserved_titles", []):
+        if title.lower() not in text_lower:
+            errors.append(f"Job title '{title}' missing or altered -- titles must never change")
 
-    # 5. Check school preserved
+    # 5. Check school preserved — each comma-separated school must appear
     preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school and preserved_school.lower() not in text_lower:
-        errors.append(f"Education '{preserved_school}' missing")
+    if preserved_school:
+        schools = [s.strip() for s in preserved_school.split(",") if s.strip()]
+        missing = [s for s in schools if s.lower() not in text_lower]
+        if missing:
+            errors.append(f"Education missing schools: {', '.join(missing)}")
 
     # 6. Check contact info preserved (warn, don't error -- we can inject)
     email = personal.get("email", "")
@@ -275,6 +291,11 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in text_lower]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
+
+    # 11b. Hard-banned phrases -- always an error, no mode exception
+    found_hard_banned = [p for p in HARD_BANNED_PHRASES if p in text_lower]
+    if found_hard_banned:
+        errors.append(f"Hard-banned phrase: '{found_hard_banned[0]}'")
 
     # 12. Duplicate section detection
     for section_name in ["summary", "experience", "education", "projects"]:
@@ -337,9 +358,15 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
 
-    # 5. Must start with "Dear" — always checked (preamble should have been stripped)
-    stripped = text.strip()
-    if not stripped.lower().startswith("dear"):
-        errors.append("Must start with 'Dear Hiring Manager,'")
+    # 4b. Hard-banned phrases -- always an error, no mode exception
+    found_hard_banned = [p for p in HARD_BANNED_PHRASES if p in text_lower]
+    if found_hard_banned:
+        errors.append(f"Hard-banned phrase: '{found_hard_banned[0]}'")
+
+    # 5. Must start with a proper salutation — English "Dear" or German "Sehr geehrt"
+    # (cover letters may be written in either language depending on the job posting).
+    stripped_lower = text.strip().lower()
+    if not (stripped_lower.startswith("dear") or stripped_lower.startswith("sehr geehrt")):
+        errors.append("Must start with 'Dear Hiring Manager,' (or 'Sehr geehrte(s) ...,' for German letters)")
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}

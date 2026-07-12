@@ -142,7 +142,13 @@ class LLMClient:
         )
         resp.raise_for_status()
         data = resp.json()
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        # Gemini 2.5+ thinking models return parts[0] as the thought (thought=true)
+        # and parts[1] as the actual response. Skip thought parts.
+        parts = data["candidates"][0]["content"]["parts"]
+        for part in parts:
+            if not part.get("thought", False) and "text" in part:
+                return part["text"]
+        return parts[-1]["text"]
 
     # -- OpenAI-compat API --------------------------------------------------
 

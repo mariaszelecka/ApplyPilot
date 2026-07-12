@@ -257,6 +257,82 @@ def apply(
 
 
 @app.command()
+def daily(
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover/apply stages."),
+    apply_limit: int = typer.Option(20, "--apply-limit", help="Max applications to submit in this run."),
+    headless: bool = typer.Option(True, "--headless/--no-headless", help="Run Chrome headless during auto-apply."),
+    validation: str = typer.Option("normal", "--validation", help="Validation strictness for tailor/cover stages."),
+    model: str = typer.Option("haiku", "--model", "-m", help="Claude model name for auto-apply."),
+    dry_run_apply: bool = typer.Option(False, "--dry-run-apply", help="Prepare everything but do not submit applications (for testing)."),
+    skip_email: bool = typer.Option(False, "--skip-email", help="Do not send the report email (for testing)."),
+) -> None:
+    """Run the full daily automation: discover/tailor/cover -> auto-apply -> email report.
+
+    Intended to be triggered once a day by an external scheduler (e.g. Windows Task
+    Scheduler). Submits real job applications by default -- use --dry-run-apply to
+    test the pipeline without actually applying.
+    """
+    _bootstrap()
+
+    from datetime import datetime, timezone
+
+    from applypilot.config import check_tier, PROFILE_PATH as _profile_path
+    from applypilot.pipeline import run_pipeline
+    from applypilot.apply.launcher import main as apply_main
+    from applypilot.report import get_applications_since, build_report_html, build_report_text
+    from applypilot.notify import send_email
+
+    # Tier 3 required: apply needs the local Chrome + Claude Code CLI.
+    check_tier(3, "daily automation")
+
+    if not _profile_path.exists():
+        console.print(
+            "[red]Profile not found.[/red]\n"
+            "Run [bold]applypilot init[/bold] to create your profile first."
+        )
+        raise typer.Exit(code=1)
+
+    run_start = datetime.now(timezone.utc).isoformat()
+    console.print("\n[bold blue]=== ApplyPilot Daily Run ===[/bold blue]")
+    console.print(f"  Started: {run_start}\n")
+
+    console.print("[bold cyan]Stage 1/2: discover -> enrich -> score -> tailor -> cover -> pdf[/bold cyan]")
+    run_pipeline(stages=["all"], min_score=min_score, validation_mode=validation)
+
+    console.print("\n[bold cyan]Stage 2/2: auto-apply[/bold cyan]")
+    try:
+        apply_main(
+            limit=apply_limit,
+            min_score=min_score,
+            headless=headless,
+            model=model,
+            dry_run=dry_run_apply,
+            continuous=False,
+        )
+    except Exception as e:
+        console.print(f"[red]Auto-apply step failed:[/red] {e}")
+        log.exception("Auto-apply failed during daily run")
+
+    applications = get_applications_since(run_start)
+    console.print(f"\n[bold green]{len(applications)} application(s) submitted this run.[/bold green]")
+
+    if not skip_email:
+        html = build_report_html(applications)
+        text = build_report_text(applications)
+        subject = f"ApplyPilot: {len(applications)} application(s) today"
+        sent = send_email(subject, html, text_body=text)
+        if sent:
+            console.print("[green]Report emailed.[/green]")
+        else:
+            console.print(
+                "[yellow]Report email NOT sent[/yellow] -- check GMAIL_ADDRESS/GMAIL_APP_PASSWORD "
+                "in ~/.applypilot/.env, or see logs for the SMTP error."
+            )
+
+    console.print("\n[bold blue]=== Daily Run Complete ===[/bold blue]\n")
+
+
+@app.command()
 def status() -> None:
     """Show pipeline statistics from the database."""
     _bootstrap()

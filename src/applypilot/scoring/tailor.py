@@ -16,7 +16,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
+from applypilot.config import CV_SKILL_PATH, RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
 from applypilot.llm import get_client
 from applypilot.scoring.validator import (
@@ -32,6 +32,27 @@ log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 
+def _load_skill_hard_rules() -> str:
+    """Load the '## Hard Rules' section from CV_TAILORING_SKILL.md at runtime.
+
+    This is what makes the skill doc load-bearing instead of just documentation:
+    editing the rules in that file changes the actual tailoring prompt on the
+    next run, with no code change needed.
+    """
+    if not CV_SKILL_PATH.exists():
+        log.warning("CV_TAILORING_SKILL.md not found at %s -- skill rules not loaded", CV_SKILL_PATH)
+        return ""
+    text = CV_SKILL_PATH.read_text(encoding="utf-8")
+    # Match the heading only when it starts a line (not an incidental mention in prose).
+    start = text.find("\n## Hard Rules\n")
+    if start == -1:
+        return ""
+    start += 1  # skip the leading newline so the section starts at "## Hard Rules"
+    end = text.find("\n## ", start + 1)
+    section = text[start:end] if end != -1 else text[start:]
+    return section.strip()
+
+
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
 def _build_tailor_prompt(profile: dict) -> str:
@@ -43,9 +64,15 @@ def _build_tailor_prompt(profile: dict) -> str:
     boundary = profile.get("skills_boundary", {})
     resume_facts = profile.get("resume_facts", {})
 
-    # Format skills boundary for the prompt
+    # Format skills boundary for the prompt. "competencies" (soft skills) are
+    # shown separately since they get their own SKILLS section, not TECHNICAL SKILLS.
+    competencies = boundary.get("competencies", [])
+    competencies_str = ", ".join(competencies) if competencies else "N/A"
+
     skills_lines = []
     for category, items in boundary.items():
+        if category == "competencies":
+            continue
         if isinstance(items, list) and items:
             label = category.replace("_", " ").title()
             skills_lines.append(f"{label}: {', '.join(items)}")
@@ -53,24 +80,27 @@ def _build_tailor_prompt(profile: dict) -> str:
 
     # Preserved entities
     companies = resume_facts.get("preserved_companies", [])
-    projects = resume_facts.get("preserved_projects", [])
-    school = resume_facts.get("preserved_school", "")
+    titles = resume_facts.get("preserved_titles", [])
     real_metrics = resume_facts.get("real_metrics", [])
 
-    companies_str = ", ".join(companies) if companies else "N/A"
-    projects_str = ", ".join(projects) if projects else "N/A"
+    # A company entry may be a list of acceptable variants (e.g. ["Credit Suisse", "UBS-CS"]);
+    # show the LLM the primary (first) name.
+    companies_str = ", ".join(c[0] if isinstance(c, list) else c for c in companies) if companies else "N/A"
+    titles_str = ", ".join(f'"{t}"' for t in titles) if titles else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
     # Include ALL banned words from the validator so the LLM knows exactly
     # what will be rejected — the validator checks for these automatically.
     banned_str = ", ".join(BANNED_WORDS)
 
-    education = profile.get("experience", {})
-    education_level = education.get("education_level", "")
+    # Loaded live from CV_TAILORING_SKILL.md -- editing that file changes this prompt.
+    skill_hard_rules = _load_skill_hard_rules()
+    skill_block = f"\n{skill_hard_rules}\n" if skill_hard_rules else ""
 
     return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
 
 Take the base resume and job description. Return a tailored resume as a JSON object.
+{skill_block}
 
 ## RECRUITER SCAN (6 seconds):
 1. Title -- matches what they're hiring?
@@ -83,19 +113,27 @@ Take the base resume and job description. Return a tailored resume as a JSON obj
 
 You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
 
+## COMPETENCIES BOUNDARY (real soft skills/competencies only, for the separate SKILLS section):
+{competencies_str}
+
 ## TAILORING RULES:
 
-TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
+TITLE: The overall resume title (top of page) should match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
+
+JOB TITLES (inside EXPERIENCE headers): copy EXACTLY as given below, verbatim -- do NOT reword, reorder, translate, or restyle them:
+{titles_str}
 
 SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
+
+COMPETENCIES: Pick 5-8 from the COMPETENCIES BOUNDARY above, most relevant first. Do not invent new ones.
 
 SKILLS: Reorder each category so the job's must-haves appear first.
 
 Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
 
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
-
 BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
+
+DATES: The "dates" field is dates ONLY (e.g. "Jan 2022 - Oct 2022"). Never put skills, tools, or keywords there.
 
 ## VOICE:
 - Write like a real engineer. Short, direct.
@@ -109,12 +147,14 @@ BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, De
 - Do NOT invent work, companies, degrees, or certifications
 - Do NOT change real numbers ({metrics_str})
 - Preserved companies: {companies_str} -- names stay as-is
-- Preserved school: {school}
+- Preserved job titles: {titles_str} -- copy exactly, never reworded
 - Must fit 1 page.
+- Do NOT include an "education" field -- education is added automatically by the system.
+- Do NOT include a "projects" field -- there is no PROJECTS section. All real work goes under EXPERIENCE only.
 
 ## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
 
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"title":"Role Title","summary":"2-3 tailored sentences.","competencies":"Competency 1, Competency 2, Competency 3, Competency 4, Competency 5","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","dates":"Mon YYYY - Mon YYYY","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}]}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
@@ -132,6 +172,9 @@ def _build_judge_prompt(profile: dict) -> str:
     real_metrics = resume_facts.get("real_metrics", [])
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
+    titles = resume_facts.get("preserved_titles", [])
+    titles_str = ", ".join(f'"{t}"' for t in titles) if titles else "N/A"
+
     return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
 
 You must answer with EXACTLY this format:
@@ -139,9 +182,9 @@ VERDICT: PASS or FAIL
 ISSUES: (list any problems, or "none")
 
 ## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
-- Change the title to match the target role
+- Change the OVERALL resume title (top of page) to match the target role
 - Rewrite the summary from scratch for the target job
-- Reorder bullets and projects to put the most relevant first
+- Reorder bullets to put the most relevant first
 - Reframe bullets to use the job's language
 - Drop low-relevance bullets and replace with more relevant ones from other sections
 - Reorder the skills section to put job-relevant skills first
@@ -153,6 +196,7 @@ ISSUES: (list any problems, or "none")
 3. Inventing work that has no basis in any original bullet (completely new achievements).
 4. Adding companies, roles, or degrees that don't exist.
 5. Changing real numbers (inflating 80% to 95%, 500 nodes to 1000 nodes).
+6. Rewording, reordering, or translating a person's actual job titles inside EXPERIENCE headers. These must appear exactly as given: {titles_str}. (The overall resume title at the top of the page is exempt -- that one IS allowed to change.)
 
 ## WHAT IS NOT FABRICATION (do NOT fail for these):
 - Rewording any bullet, even heavily, as long as the underlying work is real
@@ -161,7 +205,7 @@ ISSUES: (list any problems, or "none")
 - Describing the same work with different emphasis
 - Dropping bullets entirely
 - Reordering anything
-- Changing the title or summary completely
+- Changing the OVERALL resume title or summary completely (but NOT the job titles inside experience headers)
 
 ## TOLERANCE RULE:
 The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
@@ -263,6 +307,11 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     lines.append(sanitize_text(data["summary"]))
     lines.append("")
 
+    # Skills (soft skills/competencies) -- distinct from Technical Skills
+    lines.append("SKILLS")
+    lines.append(sanitize_text(str(data.get("competencies", ""))))
+    lines.append("")
+
     # Technical Skills
     lines.append("TECHNICAL SKILLS")
     if isinstance(data["skills"], dict):
@@ -270,29 +319,41 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
             lines.append(f"{cat}: {sanitize_text(str(val))}")
     lines.append("")
 
-    # Experience
+    # Experience -- no separate PROJECTS section; all real work lives here.
     lines.append("EXPERIENCE")
     for entry in data.get("experience", []):
         lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
+        if entry.get("dates"):
+            lines.append(sanitize_text(entry["dates"]))
         for b in entry.get("bullets", []):
             lines.append(f"- {sanitize_text(b)}")
         lines.append("")
 
-    # Projects
-    lines.append("PROJECTS")
-    for entry in data.get("projects", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
-        lines.append("")
-
-    # Education
+    # Education -- ALWAYS code-injected from profile, never LLM-generated, so
+    # degree/school/modules/thesis/GPA are never garbled, abbreviated, or fabricated.
+    # Format matches the reference CV: degree, school/location/dates, then modules,
+    # thesis (if any), GPA, and ERASMUS+ (if any), one block per degree.
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    education_history = profile.get("resume_facts", {}).get("education_history", [])
+    if education_history:
+        for edu in education_history:
+            lines.append(sanitize_text(edu.get("degree", "")).upper())
+            school_line = ", ".join(p for p in (edu.get("school", ""), edu.get("location", "")) if p)
+            lines.append(f"{school_line} | {edu.get('dates', '')}")
+            if edu.get("modules"):
+                lines.append(f"Modules: {sanitize_text(edu['modules'])}")
+            if edu.get("thesis"):
+                lines.append(f"Thesis: {sanitize_text(edu['thesis'])}")
+            if edu.get("gpa"):
+                lines.append(f"GPA: {edu['gpa']}")
+            if edu.get("erasmus"):
+                lines.append(f"ERASMUS+: {sanitize_text(edu['erasmus'])}")
+            lines.append("")
+    else:
+        # Fallback for profiles that haven't been migrated to education_history yet.
+        school = profile.get("resume_facts", {}).get("preserved_school", "")
+        education_level = profile.get("experience", {}).get("education_level", "")
+        lines.append(f"{school} | {education_level}")
 
     return "\n".join(lines)
 
@@ -400,7 +461,7 @@ def tailor_resume(
             {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
-        raw = client.chat(messages, max_tokens=2048, temperature=0.4)
+        raw = client.chat(messages, max_tokens=8192, temperature=0.4)
 
         # Parse JSON from response
         try:
