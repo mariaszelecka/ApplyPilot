@@ -276,12 +276,27 @@ def _run_one_search(
     ), axis=1)]
     filtered = before - len(df)
 
+    # Safety-net recency filter: LinkedIn's own f_TPR server-side filter isn't
+    # always exact (renewed/reposted listings can slip through), so also check
+    # the actual date_posted JobSpy returns. date_posted is day-granularity, so
+    # allow a 1-day buffer to avoid rejecting jobs posted earlier today.
+    stale = 0
+    if hours_old and "date_posted" in df.columns:
+        import math
+        from datetime import date, timedelta
+        cutoff = date.today() - timedelta(days=math.ceil(hours_old / 24) + 1)
+        before_recency = len(df)
+        df = df[df["date_posted"].isna() | (df["date_posted"] >= cutoff)]
+        stale = before_recency - len(df)
+
     conn = get_connection()
     new, existing = store_jobspy_results(conn, df, s["query"])
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
         msg += f", {filtered} filtered (location)"
+    if stale:
+        msg += f", {stale} filtered (stale, >{hours_old}h old)"
     log.info(msg)
 
     return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
@@ -441,18 +456,6 @@ def _full_crawl(
 # -- Public entry point ------------------------------------------------------
 
 def run_discovery(cfg: dict | None = None) -> dict:
-    """Main entry point for JobSpy-based job discovery.
-
-    Loads search queries and locations from the user's search config YAML,
-    then runs a full crawl across all configured job boards.
-
-    Args:
-        cfg: Override the search configuration dict. If None, loads from
-             the user's searches.yaml file.
-
-    Returns:
-        Dict with stats: new, existing, errors, db_total, queries.
-    """
     if cfg is None:
         cfg = config.load_search_config()
 
@@ -460,10 +463,45 @@ def run_discovery(cfg: dict | None = None) -> dict:
         log.warning("No search configuration found. Run `applypilot init` to create one.")
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
+    # Support new flat `searches:` format
+    if "searches" in cfg:
+        searches_list = cfg["searches"]
+        proxy = cfg.get("proxy")
+        proxy_config = parse_proxy(proxy) if proxy else None
+        init_db()
+        total_new = total_existing = total_errors = 0
+
+        for s in searches_list:
+            site_names = s.get("site_name", ["linkedin", "indeed"])
+            # Map searches format to _run_one_search format
+            search = {
+                "query": s["search_term"],
+                "location": s.get("location", ""),
+                "remote": s.get("is_remote", False),
+            }
+            defaults = {"country_indeed": "switzerland"}
+            result = _run_one_search(
+                search, site_names,
+                s.get("results_wanted", 20),
+                s.get("hours_old", cfg.get("defaults", {}).get("hours_old", 72)),
+                proxy_config, defaults, 2, ["switzerland", "zurich", "zug", "basel", "bern", "st. gallen", "lausanne", 			        "winterthur"], [], {},
+            )
+            total_new += result["new"]
+            total_existing += result["existing"]
+            total_errors += result["errors"]
+
+        conn = get_connection()
+        db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+        log.info("Full crawl complete: %d new | %d dupes | %d errors | %d total in DB",
+                 total_new, total_existing, total_errors, db_total)
+        return {"new": total_new, "existing": total_existing,
+                "errors": total_errors, "db_total": db_total}
+
+    # Legacy format fallback
     proxy = cfg.get("proxy")
     sites = cfg.get("sites")
     results_per_site = cfg.get("defaults", {}).get("results_per_site", 100)
-    hours_old = cfg.get("defaults", {}).get("hours_old", 72)
+    hours_old = s.get("hours_old", cfg.get("defaults", {}).get("hours_old", 48))
     tiers = cfg.get("tiers")
     locations = cfg.get("location_labels")
 
