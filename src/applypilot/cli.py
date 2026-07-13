@@ -316,6 +316,14 @@ def daily(
     applications = get_applications_since(run_start)
     console.print(f"\n[bold green]{len(applications)} application(s) submitted this run.[/bold green]")
 
+    try:
+        from applypilot.view import generate_dashboard
+        generate_dashboard()
+        console.print("[green]Dashboard refreshed.[/green]")
+    except Exception as e:
+        console.print(f"[yellow]Dashboard refresh failed:[/yellow] {e}")
+        log.exception("Dashboard refresh failed during daily run")
+
     if not skip_email:
         html = build_report_html(applications)
         text = build_report_text(applications)

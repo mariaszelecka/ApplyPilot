@@ -631,7 +631,12 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
         except Exception as e:
             logger.exception("Worker %d launcher error", worker_id)
             add_event(f"[W{worker_id}] Launcher error: {str(e)[:40]}")
-            release_lock(job["url"])
+            # Record the failure (increments apply_attempts) instead of just
+            # releasing the lock -- otherwise a job that fails before Chrome/
+            # Claude even start (e.g. a missing resume file) gets silently
+            # reset to a fully retryable state and loops forever, burning
+            # through the whole run's apply_limit on one broken job.
+            mark_result(job["url"], "failed", f"launcher error: {str(e)[:200]}")
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
