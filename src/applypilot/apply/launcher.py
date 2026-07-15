@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -42,6 +43,32 @@ logger = logging.getLogger(__name__)
 def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
+
+
+_CLAUDE_EXE: str | None = None
+
+
+def _resolve_claude_exe() -> str:
+    """Resolve the 'claude' CLI to its full executable path.
+
+    On Windows, npm installs it as a claude.cmd shim. subprocess.Popen(["claude", ...])
+    with shell=False goes straight to CreateProcess, which -- unlike a real shell --
+    does not try PATHEXT extensions, so the bare name fails with WinError 2 even
+    though `claude` resolves fine interactively. shutil.which() does the same PATHEXT
+    search a shell would and returns the concrete path, which CreateProcess can launch
+    directly without needing shell=True (which would complicate the stdin/stdout piping
+    this module relies on for streaming JSON).
+    """
+    global _CLAUDE_EXE
+    if _CLAUDE_EXE is None:
+        resolved = shutil.which("claude")
+        if not resolved:
+            raise RuntimeError(
+                "Could not find 'claude' on PATH. Ensure the Claude Code CLI is installed "
+                "and available (e.g. `npm install -g @anthropic-ai/claude-code`)."
+            )
+        _CLAUDE_EXE = resolved
+    return _CLAUDE_EXE
 
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
@@ -323,7 +350,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Build claude command
     cmd = [
-        "claude",
+        _resolve_claude_exe(),
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
