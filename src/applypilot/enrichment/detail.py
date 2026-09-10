@@ -25,11 +25,15 @@ from playwright.sync_api import sync_playwright
 from applypilot import config
 from applypilot.config import DB_PATH
 from applypilot.database import get_connection, init_db, ensure_columns
+from applypilot.discovery.freshness import looks_expired as _looks_expired
 from applypilot.llm import get_client
 
 log = logging.getLogger(__name__)
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
 
 # Sites that block scraping -- skip detail extraction entirely
 SKIP_DETAIL_SITES = {"glassdoor", "google", "Workopolis"}
@@ -320,6 +324,25 @@ DESCRIPTION_SELECTORS = [
 ]
 
 
+# Patterns that mean "this isn't actually an apply link" -- e.g. LinkedIn's
+# own "Apply" button for a guest (non-logged-in) page view literally points
+# to its account-creation gate, not the job. Taking that href at face value
+# produces a link that looks legitimate but leads nowhere useful; better to
+# reject it and let the caller fall back to the plain job posting URL.
+_BAD_APPLY_URL_PATTERNS = (
+    "linkedin.com/signup",
+    "linkedin.com/checkpoint",
+    "linkedin.com/uas/login",
+    "session_redirect=",
+    "authwall",
+)
+
+
+def _is_bad_apply_url(href: str) -> bool:
+    h = href.lower()
+    return any(p in h for p in _BAD_APPLY_URL_PATTERNS)
+
+
 def extract_apply_url_deterministic(page) -> str | None:
     """Try known CSS patterns for apply buttons/links."""
     for sel in APPLY_SELECTORS:
@@ -327,14 +350,15 @@ def extract_apply_url_deterministic(page) -> str | None:
             el = page.query_selector(sel)
             if el:
                 href = el.get_attribute("href")
-                if href and href != "#":
+                if href and href != "#" and not _is_bad_apply_url(href):
                     return href
                 tag = el.evaluate("el => el.tagName.toLowerCase()")
                 if tag == "button":
                     parent_href = el.evaluate("el => el.parentElement?.querySelector('a')?.href || null")
-                    if parent_href:
+                    if parent_href and not _is_bad_apply_url(parent_href):
                         return parent_href
-                    return page.url
+                    if not href:
+                        return page.url
         except Exception:
             continue
 
@@ -344,7 +368,7 @@ def extract_apply_url_deterministic(page) -> str | None:
             text = link.inner_text().strip().lower()
             if "apply" in text and len(text) < 50:
                 href = link.get_attribute("href")
-                if href and href != "#" and "javascript:" not in href:
+                if href and href != "#" and "javascript:" not in href and not _is_bad_apply_url(href):
                     return href
     except Exception:
         pass
@@ -476,6 +500,15 @@ def extract_with_llm(page, url: str) -> dict:
 
         if desc:
             desc = clean_description(desc)
+        # The model sometimes ignores the "set it to null" instruction and
+        # writes a short meta-commentary sentence instead (e.g. "the full
+        # job description is not present in the provided HTML") -- catch
+        # that so it doesn't get stored as if it were real posting content.
+        if desc and len(desc) < 300 and re.search(
+            r"\b(not present|not found|no job description|cannot find|"
+            r"unable to (find|locate)|does not contain)\b", desc, re.IGNORECASE
+        ):
+            desc = None
 
         return {"full_description": desc, "application_url": apply_url}
     except Exception as e:
@@ -565,12 +598,16 @@ def scrape_detail_page(page, url: str) -> dict:
     json_ld_result = extract_from_json_ld(intel)
     if json_ld_result and json_ld_result.get("full_description"):
         result.update(json_ld_result)
+        if result.get("application_url") and _is_bad_apply_url(result["application_url"]):
+            result["application_url"] = None
         result["tier_used"] = 1
         if not result.get("application_url"):
             apply = extract_apply_url_deterministic(page)
             if apply:
                 result["application_url"] = apply
         result["status"] = "ok" if result.get("application_url") else "partial"
+        if _looks_expired(result.get("full_description")):
+            result["status"] = "expired"
         result["elapsed"] = time.time() - t0
         return result
 
@@ -583,6 +620,8 @@ def scrape_detail_page(page, url: str) -> dict:
         result["application_url"] = apply
         result["tier_used"] = 2
         result["status"] = "ok" if apply else "partial"
+        if _looks_expired(desc):
+            result["status"] = "expired"
         result["elapsed"] = time.time() - t0
         return result
 
@@ -591,7 +630,10 @@ def scrape_detail_page(page, url: str) -> dict:
     # Tier 3: LLM
     llm_result = extract_with_llm(page, url)
     result["full_description"] = llm_result.get("full_description")
-    result["application_url"] = llm_result.get("application_url") or tier2_apply
+    llm_apply = llm_result.get("application_url")
+    if llm_apply and _is_bad_apply_url(llm_apply):
+        llm_apply = None
+    result["application_url"] = llm_apply or tier2_apply
     result["tier_used"] = 3
 
     if result.get("full_description"):
@@ -601,6 +643,8 @@ def scrape_detail_page(page, url: str) -> dict:
     else:
         result["status"] = "error"
         result["error"] = "no data extracted"
+    if _looks_expired(result.get("full_description")):
+        result["status"] = "expired"
 
     result["elapsed"] = time.time() - t0
     return result
@@ -661,7 +705,17 @@ def scrape_site_batch(
                 log.info("  %s | %s | desc=%s chars | apply=%s | %.1fs%s",
                          status, tier_str, f"{desc_len:,}", apply_str, elapsed, err_str)
 
-                if status in ("ok", "partial"):
+                if status == "expired":
+                    # Keep the scraped text for reference, but flag it via detail_error
+                    # so it's excluded from scoring -- no point tailoring a CV for a
+                    # listing that's already dead.
+                    stats["error"] += 1
+                    conn.execute(
+                        "UPDATE jobs SET full_description = ?, application_url = ?, "
+                        "detail_scraped_at = ?, detail_error = 'expired' WHERE url = ?",
+                        (result.get("full_description"), result.get("application_url"), now, url),
+                    )
+                elif status in ("ok", "partial"):
                     stats[status] += 1
                     conn.execute(
                         "UPDATE jobs SET full_description = ?, application_url = ?, "
@@ -851,6 +905,75 @@ def stream_detail(
             log.info("DONE: %d ok, %d errors in %.1fs", total_ok, total_err, elapsed)
         conn.close()
         my_done.set()
+
+
+# -- Live re-verification (shortlist, right before tailoring) ---------------
+
+def recheck_jobs(urls: list[str], delay: float = 1.5) -> dict:
+    """Re-visit a shortlist of job pages right before they get tailored.
+
+    JobSpy's discovery-time description is a snapshot -- it can go stale
+    (posting closed) by the time scoring/tailoring gets to it, and JobSpy
+    never independently verifies the apply URL. This re-runs the same
+    detail-page cascade used during enrichment (JSON-LD -> CSS -> LLM) on
+    each URL, catching newly-expired listings and refreshing the apply URL
+    from the actual destination site. Updates the DB in place.
+
+    Args:
+        urls: Job URLs to re-check (typically the tailoring shortlist).
+        delay: Seconds between page visits.
+
+    Returns:
+        {"checked": int, "expired": int, "updated": int, "errors": int}
+    """
+    stats = {"checked": 0, "expired": 0, "updated": 0, "errors": 0}
+    if not urls:
+        return stats
+
+    conn = init_db()
+    now = datetime.now(timezone.utc).isoformat()
+
+    try:
+        with sync_playwright() as p:
+            launch_opts: dict = {"headless": True}
+            if _PROXY_CONFIG:
+                launch_opts["proxy"] = _PROXY_CONFIG["playwright"]
+            browser = p.chromium.launch(**launch_opts)
+            context = browser.new_context(user_agent=UA)
+            page = context.new_page()
+
+            for url in urls:
+                result = scrape_detail_page(page, url)
+                stats["checked"] += 1
+
+                if result["status"] == "expired":
+                    stats["expired"] += 1
+                    conn.execute(
+                        "UPDATE jobs SET detail_error = 'expired', live_recheck_at = ? WHERE url = ?",
+                        (now, url),
+                    )
+                elif result.get("full_description"):
+                    stats["updated"] += 1
+                    conn.execute(
+                        "UPDATE jobs SET full_description = ?, "
+                        "application_url = COALESCE(?, application_url), "
+                        "live_recheck_at = ? WHERE url = ?",
+                        (result["full_description"], result.get("application_url"), now, url),
+                    )
+                else:
+                    stats["errors"] += 1
+                    conn.execute("UPDATE jobs SET live_recheck_at = ? WHERE url = ?", (now, url))
+
+                conn.commit()
+                time.sleep(delay)
+
+            browser.close()
+    except Exception as e:
+        log.error("Live recheck crashed: %s", e)
+
+    log.info("Live recheck: %d checked, %d expired, %d updated, %d errors",
+              stats["checked"], stats["expired"], stats["updated"], stats["errors"])
+    return stats
 
 
 # -- Public entry point ------------------------------------------------------

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 import typer
@@ -143,13 +144,360 @@ def run(
 
 
 @app.command()
+def daily(
+    min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for tailor/cover stages."),
+    workers: int = typer.Option(1, "--workers", "-w", help="Parallel threads for discovery/enrichment stages."),
+    no_email: bool = typer.Option(False, "--no-email", help="Skip sending the digest email."),
+    apply_review_limit: int = typer.Option(
+        0, "--apply-review-limit",
+        help=(
+            "Max jobs to auto-fill for a dry-run review each day. Defaults to 0 "
+            "(off): the single-gate flow submits what you approved by digest "
+            "reply, so a separate no-submit review pass isn't part of it. Set "
+            "a number to preview forms without submitting."
+        ),
+    ),
+    no_apply_review: bool = typer.Option(
+        False, "--no-apply-review", help="Skip the automatic apply review pass entirely.",
+    ),
+    live_apply_limit: int = typer.Option(
+        10, "--live-apply-limit",
+        help="Max jobs to actually submit each day, from what's already approved (0 disables).",
+    ),
+    no_live_apply: bool = typer.Option(
+        False, "--no-live-apply", help="Skip the automatic live-submit stage entirely.",
+    ),
+) -> None:
+    """Run the daily automated pipeline: discover -> enrich -> score, email one
+    digest of matches, and -- for whatever you approved by replying to a
+    previous digest -- tailor -> cover -> pdf, then submit those applications.
+
+    SINGLE-GATE FLOW: search -> match -> ONE email -> you reply with the
+    numbers you want to apply to -> ApplyPilot tailors a CV + cover letter for
+    exactly those and submits them on the next run. There is no second
+    confirmation email. A job you never named by number is never tailored and
+    never submitted.
+
+    The approval itself is still enforced in acquire_job()'s query, not here:
+    a live (submitting) run can only ever draw jobs with
+    apply_status='approved', which is set only by your own digest reply (see
+    notify.digest.check_email_approvals) or an explicit
+    `applypilot apply --approve`. Automating this stage therefore doesn't
+    weaken the gate -- nothing is submitted the day it's discovered, only
+    after you've picked it out of a digest.
+
+    --apply-review-limit (default 0, off) can still run a no-submit dry pass
+    that fills forms and screenshots them for inspection; it's not part of
+    the single-gate flow.
+
+    Intended for a scheduled task (see run_daily.ps1). Reading your replies
+    is best-effort and never blocks the rest of the run.
+    """
+    _bootstrap()
+
+    from applypilot.config import check_tier
+    from applypilot.pipeline import run_pipeline
+
+    check_tier(2, "AI scoring/tailoring")
+
+    try:
+        from applypilot.notify.digest import check_email_approvals
+        approval_result = check_email_approvals()
+        if approval_result.get("error"):
+            console.print(f"[yellow]Email approval check failed: {approval_result['error']}[/yellow]")
+        elif approval_result["requested"] or approval_result["approved"]:
+            console.print(
+                f"[bold blue]Email approvals found:[/bold blue] "
+                f"{len(approval_result['requested'])} approved by digest reply, "
+                f"{len(approval_result['approved'])} approved for submission."
+            )
+    except Exception as e:
+        log.exception("Email approval check failed")
+        console.print(f"[yellow]Email approval check failed: {e}[/yellow]")
+
+    # Fresh discovery + matching only -- no tailoring yet, since nothing has
+    # been approved for today's new matches until the digest goes out and
+    # you reply.
+    result = run_pipeline(
+        stages=["discover", "enrich", "score"],
+        min_score=min_score,
+        workers=workers,
+        validation_mode="normal",
+    )
+
+    # Everything you approved (by digest reply just now, or on an earlier run
+    # whose tailoring didn't finish) that still has no CV. Read from the DB
+    # rather than only check_email_approvals()'s return value, so an approved
+    # job is never silently dropped because a previous run died mid-way.
+    from applypilot.database import get_connection as _get_conn
+    _conn = _get_conn()
+    requested_urls = [
+        r[0] for r in _conn.execute(
+            "SELECT url FROM jobs WHERE apply_status = 'approved' "
+            "AND tailored_resume_path IS NULL"
+        ).fetchall()
+    ]
+
+    if requested_urls:
+        console.print(
+            f"\n[bold blue]Preparing approved jobs[/bold blue] "
+            f"({len(requested_urls)} job(s): tailoring CV + cover letter)"
+        )
+        try:
+            from applypilot.scoring.tailor import run_tailoring
+            from applypilot.scoring.cover_letter import run_cover_letters
+            from applypilot.scoring.pdf import batch_convert
+
+            run_tailoring(job_urls=requested_urls, validation_mode="normal")
+            run_cover_letters(job_urls=requested_urls, validation_mode="normal")
+            batch_convert()
+        except Exception as e:
+            log.exception("Tailoring approved jobs failed")
+            console.print(f"[yellow]Tailoring approved jobs failed: {e}[/yellow]")
+
+    # Re-score anything that qualifies for a digest but predates the
+    # WHY/MISSING fields. Without this, older jobs scored before those columns
+    # existed reach the inbox with prose instead of bullets and "Not assessed"
+    # where the gap should be.
+    try:
+        from applypilot.database import get_connection as _gc
+        _c = _gc()
+        stale = [
+            r[0] for r in _c.execute(
+                "SELECT url FROM jobs WHERE fit_score >= ? AND digest_sent_at IS NULL "
+                "AND (score_why IS NULL OR score_why = '') "
+                "AND discovered_at >= datetime('now', '-4 days') "
+                "AND (apply_status IS NULL OR apply_status != 'applied')",
+                (min_score,),
+            ).fetchall()
+        ]
+        if stale:
+            console.print(
+                f"[bold blue]Re-scoring[/bold blue] {len(stale)} job(s) missing the "
+                f"why/gap breakdown before the digest..."
+            )
+            from applypilot.scoring.scorer import rescore_urls
+            rescore_urls(stale)
+    except Exception as e:
+        log.exception("Pre-digest rescore failed")
+        console.print(f"[yellow]Pre-digest rescore failed: {e}[/yellow]")
+
+    if no_email:
+        console.print(
+            "\n[bold yellow]Digest email skipped (--no-email).[/bold yellow] "
+            "Nothing was submitted -- ApplyPilot never applies automatically."
+        )
+    else:
+        from applypilot.notify.digest import send_daily_digest
+        digest_result = send_daily_digest(min_score=min_score)
+        if digest_result.get("error"):
+            console.print(f"\n[red]Digest email failed:[/red] {digest_result['error']}")
+        elif digest_result["jobs"] == 0:
+            console.print("\n[dim]No new job matches to email today.[/dim]")
+        else:
+            console.print(
+                f"\n[bold green]Digest emailed:[/bold green] {digest_result['jobs']} new job match(es). "
+                "Nothing tailored or submitted yet -- reply with the numbers you approve."
+            )
+
+    # Apply review pass: Tier 3 only (Claude CLI + Chrome), always --dry-run,
+    # always headless. Best-effort -- a failure here must never fail the
+    # whole daily run, since the digest (the established, reliable part)
+    # already succeeded above.
+    if no_apply_review or apply_review_limit <= 0:
+        console.print("[dim]Apply review pass skipped.[/dim]")
+    else:
+        from applypilot.config import get_tier
+        if get_tier() < 3:
+            console.print(
+                "[dim]Apply review pass skipped -- Tier 3 (Claude Code CLI + Chrome) not available.[/dim]"
+            )
+        else:
+            try:
+                from applypilot.apply.launcher import main as apply_main
+                console.print(
+                    f"\n[bold blue]Apply review pass[/bold blue] "
+                    f"(up to {apply_review_limit} jobs, headless, dry-run -- never submits)"
+                )
+                apply_main(
+                    limit=apply_review_limit,
+                    min_score=min_score,
+                    headless=True,
+                    dry_run=True,
+                    workers=1,
+                )
+            except Exception as e:
+                log.exception("Apply review pass failed")
+                console.print(f"[yellow]Apply review pass failed (digest already sent): {e}[/yellow]")
+
+    # Live-submit stage: Tier 3 only, headless, dry_run=False -- but this can
+    # ONLY ever pick up apply_status='approved' jobs (acquire_job()'s query,
+    # not this command, enforces that), so it never submits anything you
+    # haven't already reviewed and approved yourself on a prior run.
+    # Best-effort, same as the review pass above.
+    if no_live_apply or live_apply_limit <= 0:
+        console.print("[dim]Live-submit stage skipped.[/dim]")
+    else:
+        from applypilot.config import get_tier
+        if get_tier() < 3:
+            console.print(
+                "[dim]Live-submit stage skipped -- Tier 3 (Claude Code CLI + Chrome) not available.[/dim]"
+            )
+        else:
+            try:
+                from applypilot.apply.launcher import main as apply_main
+                console.print(
+                    f"\n[bold red]Live-submit stage[/bold red] "
+                    f"(up to {live_apply_limit} jobs, headless, approved-only -- submits for real)"
+                )
+                apply_main(
+                    limit=live_apply_limit,
+                    min_score=min_score,
+                    headless=True,
+                    dry_run=False,
+                    workers=1,
+                )
+            except Exception as e:
+                log.exception("Live-submit stage failed")
+                console.print(f"[yellow]Live-submit stage failed (digest already sent): {e}[/yellow]")
+
+    if result.get("errors"):
+        raise typer.Exit(code=1)
+
+
+@app.command()
+def poll(
+    limit: int = typer.Option(
+        5, "--limit", "-l",
+        help="Max applications to submit in one poll (bounds spend per tick).",
+    ),
+    no_apply: bool = typer.Option(
+        False, "--no-apply",
+        help="Read replies and tailor the approved jobs, but don't submit anything.",
+    ),
+) -> None:
+    """Act on digest replies now, instead of waiting for tomorrow's daily run.
+
+    Designed to run on a short interval (every ~15 min) alongside the once-a-day
+    `daily` command. It does NO discovery and NO scoring, so it is free when
+    idle: reading the mailbox costs nothing, and money is only spent once you
+    have actually approved something.
+
+    WHAT IT APPLIES TO: only jobs you approved yourself, by replying to a digest
+    with their numbers. This command adds no job-selection logic of its own --
+    it reuses the same apply_status='approved' gate enforced inside
+    acquire_job(), so it can never reach a job you didn't name. It just acts on
+    your approval in minutes rather than up to a day later.
+
+    Steps: read unread replies -> tailor CV + cover letter for anything newly
+    approved that lacks one -> submit up to --limit of them.
+    """
+    _bootstrap()
+
+    from applypilot.config import APP_DIR, get_tier
+    from applypilot.database import get_connection
+
+    # Never run while a daily run is active -- they would contend for the DB and,
+    # worse, drive two Chrome/apply stages at once. Own lock, plus a check on
+    # daily's. A lock whose PID is gone is stale and gets taken over.
+    def _stale(lock_path) -> bool:
+        if not lock_path.exists():
+            return True
+        try:
+            pid = int(lock_path.read_text().strip())
+        except (ValueError, OSError):
+            return True
+        if pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        return False
+
+    daily_lock = APP_DIR / "daily.lock"
+    poll_lock = APP_DIR / "poll.lock"
+    if not _stale(daily_lock):
+        console.print("[dim]Daily run in progress -- skipping this poll.[/dim]")
+        return
+    if not _stale(poll_lock):
+        console.print("[dim]Another poll is still running -- skipping.[/dim]")
+        return
+
+    poll_lock.write_text(str(os.getpid()))
+    try:
+        try:
+            from applypilot.notify.digest import check_email_approvals
+            approval = check_email_approvals()
+            if approval.get("error"):
+                console.print(f"[yellow]Approval check failed: {approval['error']}[/yellow]")
+                return
+            newly = approval["requested"] + approval["approved"]
+            if newly:
+                console.print(f"[bold blue]New approvals:[/bold blue] {len(newly)} job(s).")
+        except Exception as e:
+            log.exception("Poll: approval check failed")
+            console.print(f"[yellow]Approval check failed: {e}[/yellow]")
+            return
+
+        conn = get_connection()
+        untailored = [
+            r[0] for r in conn.execute(
+                "SELECT url FROM jobs WHERE apply_status = 'approved' "
+                "AND tailored_resume_path IS NULL"
+            ).fetchall()
+        ]
+        ready = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'approved' "
+            "AND tailored_resume_path IS NOT NULL"
+        ).fetchone()[0]
+
+        if not untailored and not ready:
+            console.print("[dim]Nothing approved. Nothing to do.[/dim]")
+            return
+
+        if untailored:
+            console.print(f"[bold blue]Tailoring[/bold blue] {len(untailored)} approved job(s)...")
+            try:
+                from applypilot.scoring.tailor import run_tailoring
+                from applypilot.scoring.cover_letter import run_cover_letters
+                from applypilot.scoring.pdf import batch_convert
+                run_tailoring(job_urls=untailored, validation_mode="normal")
+                run_cover_letters(job_urls=untailored, validation_mode="normal")
+                batch_convert()
+            except Exception as e:
+                log.exception("Poll: tailoring failed")
+                console.print(f"[yellow]Tailoring failed: {e}[/yellow]")
+
+        if no_apply:
+            console.print("[dim]--no-apply: stopping before submission.[/dim]")
+            return
+        if get_tier() < 3:
+            console.print("[dim]Submission skipped -- Tier 3 not available.[/dim]")
+            return
+
+        try:
+            from applypilot.apply.launcher import main as apply_main
+            console.print(f"[bold red]Submitting[/bold red] up to {limit} approved job(s)...")
+            # min_score=0: approval is the gate here, not the score. A job you
+            # explicitly named must not be silently skipped because a re-score
+            # later nudged it below the digest threshold.
+            apply_main(limit=limit, min_score=0, headless=True, dry_run=False, workers=1)
+        except Exception as e:
+            log.exception("Poll: submission failed")
+            console.print(f"[yellow]Submission failed: {e}[/yellow]")
+    finally:
+        poll_lock.unlink(missing_ok=True)
+
+
+@app.command()
 def apply(
     limit: Optional[int] = typer.Option(None, "--limit", "-l", help="Max applications to submit."),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel browser workers."),
     min_score: int = typer.Option(7, "--min-score", help="Minimum fit score for job selection."),
     model: str = typer.Option("haiku", "--model", "-m", help="Claude model name."),
     continuous: bool = typer.Option(False, "--continuous", "-c", help="Run forever, polling for new jobs."),
-    dry_run: bool = typer.Option(False, "--dry-run", help="Preview actions without submitting."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Review mode: fill the form, screenshot it, write a summary, but never click Submit. Sets apply_status='pending_review' -- does NOT apply."),
     headless: bool = typer.Option(False, "--headless", help="Run browsers in headless mode."),
     url: Optional[str] = typer.Option(None, "--url", help="Apply to a specific job URL."),
     gen: bool = typer.Option(False, "--gen", help="Generate prompt file for manual debugging instead of running."),
@@ -157,8 +505,22 @@ def apply(
     mark_failed: Optional[str] = typer.Option(None, "--mark-failed", help="Manually mark a job URL as failed (provide URL)."),
     fail_reason: Optional[str] = typer.Option(None, "--fail-reason", help="Reason for --mark-failed."),
     reset_failed: bool = typer.Option(False, "--reset-failed", help="Reset all failed jobs for retry."),
+    list_pending: bool = typer.Option(False, "--list-pending", help="List jobs awaiting review (from a --dry-run pass) with their filled-form summaries."),
+    approve: Optional[str] = typer.Option(None, "--approve", help="Approve one pending_review job (by URL) for a real submission."),
+    approve_all: bool = typer.Option(False, "--approve-all", help="Approve every pending_review job. Read --list-pending first."),
 ) -> None:
-    """Launch auto-apply to submit job applications."""
+    """Launch auto-apply to submit job applications.
+
+    SAFETY MODEL: a real (live, submitting) run only ever picks up jobs with
+    apply_status='approved' -- it is not possible to submit a real
+    application that hasn't first been through a --dry-run review pass and
+    been explicitly approved via --approve/--approve-all. The workflow is:
+
+        1. applypilot apply --dry-run [--limit N]   (fills forms, never submits, queues for review)
+        2. applypilot apply --list-pending           (read what would have been submitted)
+        3. applypilot apply --approve <url>          (or --approve-all, once you're satisfied)
+        4. applypilot apply [--limit N]               (submits ONLY the approved jobs, for real)
+    """
     _bootstrap()
 
     from applypilot.config import check_tier, PROFILE_PATH as _profile_path
@@ -182,6 +544,37 @@ def apply(
         from applypilot.apply.launcher import reset_failed as do_reset
         count = do_reset()
         console.print(f"[green]Reset {count} failed job(s) for retry.[/green]")
+        return
+
+    if list_pending:
+        from applypilot.apply.launcher import list_pending_review
+        jobs = list_pending_review()
+        if not jobs:
+            console.print("[dim]No jobs pending review. Run `applypilot apply --dry-run` first.[/dim]")
+            return
+        for j in jobs:
+            console.print(f"\n[bold]{j['title']}[/bold] @ {j.get('company') or j.get('site', 'Unknown')} "
+                          f"(score {j.get('fit_score', '?')}/10)")
+            console.print(f"[dim]{j['url']}[/dim]")
+            console.print(j.get("review_notes") or "[dim](no summary captured)[/dim]")
+            console.print("[dim]" + "-" * 60 + "[/dim]")
+        console.print(f"\n[bold]{len(jobs)} job(s) pending review.[/bold] "
+                       f"Approve with [bold]--approve <url>[/bold] or [bold]--approve-all[/bold].")
+        return
+
+    if approve:
+        from applypilot.apply.launcher import approve_job
+        if approve_job(approve):
+            console.print(f"[green]Approved for real submission:[/green] {approve}")
+        else:
+            console.print(f"[red]No pending_review job matched that URL.[/red] "
+                           f"Run [bold]--list-pending[/bold] to see what's waiting.")
+        return
+
+    if approve_all:
+        from applypilot.apply.launcher import approve_all_pending
+        count = approve_all_pending()
+        console.print(f"[green]Approved {count} job(s) for real submission.[/green]")
         return
 
     # --- Full apply mode ---
@@ -230,6 +623,25 @@ def apply(
         )
         return
 
+    # Check 4: a live (submitting) run only ever draws from apply_status='approved'
+    # -- warn clearly rather than silently reporting "queue empty" if there's
+    # nothing approved yet, since that's the most likely first-time mistake.
+    if not dry_run and not url:
+        conn = get_connection()
+        approved_count = conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE apply_status = 'approved'"
+        ).fetchone()[0]
+        if approved_count == 0:
+            console.print(
+                "[yellow]No jobs are approved for submission yet.[/yellow]\n"
+                "A live run only submits jobs that have been through review and approval:\n"
+                "  1. [bold]applypilot apply --dry-run[/bold]     (fill forms, never submit, queue for review)\n"
+                "  2. [bold]applypilot apply --list-pending[/bold] (read the summaries)\n"
+                "  3. [bold]applypilot apply --approve-all[/bold]  (or --approve <url> for specific ones)\n"
+                "  4. [bold]applypilot apply[/bold]                (submits only what's approved)"
+            )
+            raise typer.Exit(code=1)
+
     from applypilot.apply.launcher import main as apply_main
 
     effective_limit = limit if limit is not None else (0 if continuous else 1)
@@ -239,7 +651,10 @@ def apply(
     console.print(f"  Workers:  {workers}")
     console.print(f"  Model:    {model}")
     console.print(f"  Headless: {headless}")
-    console.print(f"  Dry run:  {dry_run}")
+    if dry_run:
+        console.print(f"  Mode:     [yellow]REVIEW (--dry-run)[/yellow] -- fills forms, never submits, queues for your approval")
+    else:
+        console.print(f"  Mode:     [bold red]LIVE[/bold red] -- will submit real applications for approved jobs only")
     if url:
         console.print(f"  Target:   {url}")
     console.print()

@@ -68,7 +68,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
     Schema columns by stage:
       - Discovery:  url, title, salary, description, location, site, strategy, discovered_at
       - Enrichment: full_description, application_url, detail_scraped_at, detail_error
-      - Scoring:    fit_score, score_reasoning, scored_at
+      - Scoring:    fit_score, score_reasoning, score_why, score_missing, scored_at
       - Tailoring:  tailored_resume_path, tailored_at, tailor_attempts
       - Cover:      cover_letter_path, cover_letter_at, cover_attempts
       - Apply:      applied_at, apply_status, apply_error, apply_attempts,
@@ -92,6 +92,7 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Discovery stage (smart_extract / job_search)
             url                   TEXT PRIMARY KEY,
             title                 TEXT,
+            company               TEXT,
             salary                TEXT,
             description           TEXT,
             location              TEXT,
@@ -108,6 +109,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             -- Scoring stage (job_scorer)
             fit_score             INTEGER,
             score_reasoning       TEXT,
+            score_why             TEXT,
+            score_missing         TEXT,
             scored_at             TEXT,
 
             -- Tailoring stage (resume tailor)
@@ -129,7 +132,8 @@ def init_db(db_path: Path | str | None = None) -> sqlite3.Connection:
             last_attempted_at     TEXT,
             apply_duration_ms     INTEGER,
             apply_task_id         TEXT,
-            verification_confidence TEXT
+            verification_confidence TEXT,
+            review_notes          TEXT
         )
     """)
     conn.commit()
@@ -147,6 +151,7 @@ _ALL_COLUMNS: dict[str, str] = {
     # Discovery
     "url": "TEXT PRIMARY KEY",
     "title": "TEXT",
+    "company": "TEXT",
     "salary": "TEXT",
     "description": "TEXT",
     "location": "TEXT",
@@ -161,6 +166,9 @@ _ALL_COLUMNS: dict[str, str] = {
     # Scoring
     "fit_score": "INTEGER",
     "score_reasoning": "TEXT",
+    "score_why": "TEXT",
+    "score_missing": "TEXT",
+    "digest_position": "INTEGER",
     "scored_at": "TEXT",
     # Tailoring
     "tailored_resume_path": "TEXT",
@@ -180,6 +188,15 @@ _ALL_COLUMNS: dict[str, str] = {
     "apply_duration_ms": "INTEGER",
     "apply_task_id": "TEXT",
     "verification_confidence": "TEXT",
+    # Human-in-the-loop review gate (see applypilot.apply.launcher): a dry-run
+    # pass fills the form but never submits, writes its summary here, and sets
+    # apply_status='pending_review'. A live (non-dry-run) run only ever picks
+    # up jobs with apply_status='approved' -- see acquire_job().
+    "review_notes": "TEXT",
+    # Daily digest email (see applypilot.notify.digest)
+    "digest_sent_at": "TEXT",
+    # Live freshness re-check right before tailoring (see enrichment.detail.recheck_jobs)
+    "live_recheck_at": "TEXT",
 }
 
 
@@ -332,7 +349,7 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
 
     Args:
         conn: Database connection.
-        jobs: List of job dicts with keys: url, title, salary, description, location.
+        jobs: List of job dicts with keys: url, title, company, salary, description, location.
         site: Source site name (e.g. "RemoteOK", "Dice").
         strategy: Extraction strategy used (e.g. "json_ld", "api_response", "css_selectors").
 
@@ -349,9 +366,9 @@ def store_jobs(conn: sqlite3.Connection, jobs: list[dict],
             continue
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, job.get("title"), job.get("salary"), job.get("description"),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, job.get("title"), job.get("company"), job.get("salary"), job.get("description"),
                  job.get("location"), site, strategy, now),
             )
             new += 1
@@ -380,15 +397,29 @@ def get_jobs_by_stage(conn: sqlite3.Connection | None = None,
     if conn is None:
         conn = get_connection()
 
+    # Jobs older than this (by our own discovery timestamp) never reach scoring
+    # or tailoring, even if they linger un-scored in the DB -- prevents stale
+    # backlog (e.g. from a discovery run under old/looser hours_old settings)
+    # from silently resurfacing and crowding out fresh results. JobSpy's own
+    # hours_old + date_posted filters already keep freshly-discovered jobs
+    # recent; this is a second, DB-level backstop.
+    _FRESHNESS_CUTOFF = "datetime('now', '-4 days')"
+
     conditions = {
         "discovered": "1=1",
         "pending_detail": "detail_scraped_at IS NULL",
         "enriched": "full_description IS NOT NULL",
-        "pending_score": "full_description IS NOT NULL AND fit_score IS NULL",
+        "pending_score": (
+            "full_description IS NOT NULL AND fit_score IS NULL "
+            "AND (detail_error IS NULL OR detail_error != 'expired') "
+            f"AND discovered_at >= {_FRESHNESS_CUTOFF}"
+        ),
         "scored": "fit_score IS NOT NULL",
         "pending_tailor": (
             "fit_score >= ? AND full_description IS NOT NULL "
-            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5"
+            "AND tailored_resume_path IS NULL AND COALESCE(tailor_attempts, 0) < 5 "
+            "AND (detail_error IS NULL OR detail_error != 'expired') "
+            f"AND discovered_at >= {_FRESHNESS_CUTOFF}"
         ),
         "tailored": "tailored_resume_path IS NOT NULL",
         "pending_apply": (

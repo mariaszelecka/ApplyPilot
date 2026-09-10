@@ -17,8 +17,38 @@ from applypilot import config
 
 logger = logging.getLogger(__name__)
 
-# CDP port base — each worker uses BASE_CDP_PORT + worker_id
-BASE_CDP_PORT = 9222
+# CDP port base — each worker uses BASE_CDP_PORT + worker_id.
+#
+# Deliberately NOT 9222. That's the default remote-debugging port for every
+# Chromium-based tool, and some machines have a background app (a vendor
+# utility, an Electron app, an embedded WebView) already listening on it. When
+# that happens Chrome launches fine but Playwright's MCP attaches to the OTHER
+# process instead: the visible Chrome window sits empty while the agent drives
+# something else, producing page_error and "this is a different site entirely"
+# style confusion. _kill_on_port can't win that race reliably -- the squatter
+# respawns and can re-grab the port before Chrome binds it.
+BASE_CDP_PORT = 9722
+
+
+def find_free_cdp_port(preferred: int, attempts: int = 40) -> int:
+    """Return `preferred` if nothing else holds it, else the next free port.
+
+    Guards against another application owning the debugging port, which
+    silently hands our automation the wrong browser rather than failing.
+    """
+    import socket
+    for offset in range(attempts):
+        candidate = preferred + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("127.0.0.1", candidate))
+            except OSError:
+                continue
+        if offset:
+            logger.warning("CDP port %d is in use; using %d instead.", preferred, candidate)
+        return candidate
+    raise RuntimeError(f"No free CDP port found near {preferred}")
 
 # Track Chrome processes per worker for cleanup
 _chrome_procs: dict[int, subprocess.Popen] = {}
@@ -240,8 +270,32 @@ def launch_chrome(worker_id: int, port: int | None = None,
     if platform.system() != "Windows":
         import os
         kwargs["preexec_fn"] = os.setsid
+    else:
+        # Detach on Windows too. Without this Chrome stays inside the parent's
+        # process group and job object, so it dies the moment the launching
+        # process tree is torn down -- which defeated the CAPTCHA hand-off:
+        # the atexit sweep correctly stood down, and the window still vanished
+        # before it could be used. DETACHED_PROCESS + a new process group give
+        # Chrome its own lifetime; CREATE_BREAKAWAY_FROM_JOB (0x01000000) also
+        # escapes a kill-on-close job object, but is refused when the job
+        # forbids breakaway, so it is attempted and then dropped.
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+        )
 
-    proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        proc = subprocess.Popen(cmd, **kwargs)
+    except OSError:
+        if platform.system() == "Windows":
+            kwargs["creationflags"] = (
+                subprocess.CREATE_NEW_PROCESS_GROUP
+                | getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+            )
+            proc = subprocess.Popen(cmd, **kwargs)
+        else:
+            raise
     with _chrome_lock:
         _chrome_procs[worker_id] = proc
 
@@ -303,11 +357,31 @@ def reset_worker_dir(worker_id: int) -> Path:
     return worker_dir
 
 
+_keep_browser_open = False
+
+
+def keep_browser_open() -> None:
+    """Ask the atexit handler to leave the browser running.
+
+    Used for the CAPTCHA hand-off: the form is filled and only the CAPTCHA is
+    left, so the window has to survive process exit for a human to finish it.
+    Without this, skipping cleanup_worker() achieved nothing -- cleanup_on_exit
+    still killed every worker Chrome a moment later, and the filled form
+    vanished before it could be touched.
+    """
+    global _keep_browser_open
+    _keep_browser_open = True
+
+
 def cleanup_on_exit() -> None:
     """Atexit handler: kill all Chrome processes and sweep CDP ports.
 
     Register this with atexit.register() at application startup.
     """
+    if _keep_browser_open:
+        logger.info("Leaving Chrome open for manual CAPTCHA completion.")
+        return
+
     with _chrome_lock:
         procs = dict(_chrome_procs)
         _chrome_procs.clear()

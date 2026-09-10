@@ -24,13 +24,38 @@ blocked:
     - "%accenture%"
     - "%workopolis.com/out%"
 
-# ── Blocked SSO domains — cannot authenticate through these ──────────────
+# ── Blocked SSO domains — the agent will NEVER type a password on these ──
+# Security boundary, not a "skip entirely" list: if the browser's cloned
+# profile is already authenticated (log into these once in your real
+# Chrome), the agent reuses that session and clicks through an account
+# picker/consent screen. It only refuses when a fresh login is required
+# (unauthenticated), since typing Google/Microsoft/Okta credentials via
+# automation gets flagged as suspicious and can trip account security.
 blocked_sso:
   - "accounts.google.com"
   - "login.microsoftonline.com"
   - "okta.com"
   - "auth0.com"
   - "sso.cisco.com"
+
+# ── Known shared ATS login domains ────────────────────────────────────────
+# Same reasoning as blocked_sso: these are shared platforms used by many
+# different employers. Create ONE account on each (in your real Chrome,
+# manually, once) and the cloned worker profile reuses that session for
+# every company that happens to use the same platform -- no bot-driven
+# signup needed. If not yet authenticated, the agent fails that job
+# gracefully rather than attempting to sign up with a generated identity.
+known_ats_domains:
+  - "greenhouse.io"
+  - "lever.co"
+  - "myworkdayjobs.com"
+  - "myworkday.com"
+  - "smartrecruiters.com"
+  - "jobs.ashbyhq.com"
+  - "icims.com"
+  - "taleo.net"
+  - "successfactors.com"
+  - "bamboohr.com"
 
 # ── Base URLs for URL resolution ─────────────────────────────────────────
 # Used by detail enrichment to resolve relative URLs scraped from sites.

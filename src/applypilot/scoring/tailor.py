@@ -1,12 +1,19 @@
 """Resume tailoring: LLM-powered ATS-optimized resume generation per job.
 
-THIS IS THE HEAVIEST REFACTOR. Every piece of personal data -- name, email, phone,
-skills, companies, projects, school -- is loaded at runtime from the user's profile.
-Zero hardcoded personal information.
+Every application does ONE fresh, strictly-grounded rephrase of resume.txt
+for exactly three things: Professional Summary, Experience bullets (job
+scope + achievements), and Skills (a relevant subset of the master list).
 
-The LLM returns structured JSON, code assembles the final text. Header (name, contact)
-is always code-injected, never LLM-generated. Each retry starts a fresh conversation
-to avoid apologetic spirals.
+Everything else -- header, Projects, Education, Software Skills, Languages,
+Certifications -- is extracted VERBATIM from resume.txt and never touches
+the LLM at all, so it can never drift, be fabricated, or reformatted. Job
+titles, company names, and dates inside Experience are also frozen verbatim
+(enforced in code, not just prompted) -- only job_scope/achievements bullet
+wording may adapt to the target job's terminology.
+
+No caching layer: since bullets are now allowed to vary per job (unlike the
+old frozen-baseline design), there's nothing worth pre-computing. Each call
+re-reads resume.txt fresh.
 """
 
 import json
@@ -18,13 +25,13 @@ from pathlib import Path
 
 from applypilot.config import RESUME_PATH, TAILORED_DIR, load_profile
 from applypilot.database import get_connection, get_jobs_by_stage
-from applypilot.llm import get_client
+from applypilot.llm import LLMCircuitOpenError, get_client
+from applypilot.scoring.region_quota import select_with_quota
 from applypilot.scoring.validator import (
     BANNED_WORDS,
-    FABRICATION_WATCHLIST,
+    company_variants,
     sanitize_text,
     validate_json_fields,
-    validate_tailored_resume,
 )
 
 log = logging.getLogger(__name__)
@@ -32,170 +39,199 @@ log = logging.getLogger(__name__)
 MAX_ATTEMPTS = 5  # max cross-run retries before giving up
 
 
+# ── resume.txt section extraction (frozen, verbatim, never LLM-touched) ───
+
+_RESUME_SECTION_HEADERS = (
+    "PROFESSIONAL EXPERIENCE", "EXPERIENCE", "PROJECTS", "EDUCATION",
+    "CERTIFICATIONS", "LANGUAGES", "SKILLS", "SOFTWARE SKILLS", "TECHNICAL SKILLS",
+)
+
+
+def extract_resume_section(resume_text: str, header: str) -> str:
+    """Extract a section's raw text verbatim from the master resume, from its
+    header line up to (not including) the next known section header."""
+    lines = resume_text.splitlines()
+    start = None
+    for i, line in enumerate(lines):
+        if line.strip().upper() == header.upper():
+            start = i + 1
+            break
+    if start is None:
+        return ""
+
+    end = len(lines)
+    for i in range(start, len(lines)):
+        if lines[i].strip().upper() in _RESUME_SECTION_HEADERS:
+            end = i
+            break
+
+    section_lines = lines[start:end]
+    while section_lines and not section_lines[0].strip():
+        section_lines.pop(0)
+    while section_lines and not section_lines[-1].strip():
+        section_lines.pop()
+    return "\n".join(section_lines)
+
+
+def extract_summary(resume_text: str) -> str:
+    """The About paragraph: the line(s) after the name/contact header, before
+    the first section header."""
+    lines = resume_text.splitlines()
+    body_start = None
+    for i, line in enumerate(lines):
+        if line.strip().upper() in _RESUME_SECTION_HEADERS:
+            body_start = i
+            break
+    if body_start is None:
+        return ""
+    summary_lines = [l.strip() for l in lines[2:body_start] if l.strip()]
+    return " ".join(summary_lines).strip()
+
+
+def extract_skills_list(resume_text: str) -> list[str]:
+    """The master SKILLS line, split into individual items -- the ONLY pool
+    a per-job tailoring pass may select from."""
+    text = extract_resume_section(resume_text, "SKILLS")
+    return [s.strip() for s in text.split("|") if s.strip()]
+
+
+def parse_experience_entries(resume_text: str) -> list[dict]:
+    """Parse PROFESSIONAL EXPERIENCE into structured entries -- header,
+    company_line, job_scope bullets, achievements bullets -- all verbatim
+    from resume.txt. This is the grounding truth the per-job rephrase works
+    from, and the fallback the code falls back to if the LLM drops or
+    reorders an entry.
+    """
+    text = extract_resume_section(resume_text, "PROFESSIONAL EXPERIENCE")
+    if not text:
+        text = extract_resume_section(resume_text, "EXPERIENCE")
+
+    entries: list[dict] = []
+    current: dict | None = None
+    in_achievements = False
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        is_bullet = line.startswith("•") or line.startswith("-")
+        if is_bullet:
+            if current is None:
+                continue
+            bullet_text = line.lstrip("•-").strip()
+            (current["achievements"] if in_achievements else current["job_scope"]).append(bullet_text)
+        elif line.upper().rstrip(":") == "ACHIEVEMENTS":
+            in_achievements = True
+        elif current is None or current["company_line"]:
+            # New entry's title line
+            if current:
+                entries.append(current)
+            current = {"header": line, "company_line": "", "job_scope": [], "achievements": []}
+            in_achievements = False
+        else:
+            # This entry's "Company - Location, Dates" line
+            current["company_line"] = line
+
+    if current:
+        entries.append(current)
+    return entries
+
+
 # ── Prompt Builders (profile-driven) ──────────────────────────────────────
 
 def _build_tailor_prompt(profile: dict) -> str:
-    """Build the resume tailoring system prompt from the user's profile.
-
-    All skills boundaries, preserved entities, and formatting rules are
-    derived from the profile -- nothing is hardcoded.
-    """
-    boundary = profile.get("skills_boundary", {})
+    """Build the per-job tailoring prompt. Grounded strictly in the original
+    resume text -- rephrasing and job-description terminology are allowed,
+    invention is not."""
     resume_facts = profile.get("resume_facts", {})
-
-    # Format skills boundary for the prompt
-    skills_lines = []
-    for category, items in boundary.items():
-        if isinstance(items, list) and items:
-            label = category.replace("_", " ").title()
-            skills_lines.append(f"{label}: {', '.join(items)}")
-    skills_block = "\n".join(skills_lines)
-
-    # Preserved entities
-    companies = resume_facts.get("preserved_companies", [])
-    projects = resume_facts.get("preserved_projects", [])
-    school = resume_facts.get("preserved_school", "")
     real_metrics = resume_facts.get("real_metrics", [])
-
-    companies_str = ", ".join(companies) if companies else "N/A"
-    projects_str = ", ".join(projects) if projects else "N/A"
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
-
-    # Include ALL banned words from the validator so the LLM knows exactly
-    # what will be rejected — the validator checks for these automatically.
     banned_str = ", ".join(BANNED_WORDS)
 
-    education = profile.get("experience", {})
-    education_level = education.get("education_level", "")
+    preserved_titles = resume_facts.get("preserved_titles", [])
+    titles_str = ", ".join(preserved_titles) if preserved_titles else "N/A"
 
-    return f"""You are a senior technical recruiter rewriting a resume to get this person an interview.
+    companies = resume_facts.get("preserved_companies", [])
+    companies_str = ", ".join("/".join(company_variants(c)) for c in companies) if companies else "N/A"
 
-Take the base resume and job description. Return a tailored resume as a JSON object.
+    languages = profile.get("languages", {})
+    languages_str = ", ".join(f"{lang} - {level}" for lang, level in languages.items())
 
-## RECRUITER SCAN (6 seconds):
-1. Title -- matches what they're hiring?
-2. Summary -- 2 sentences proving you've done this work
-3. First 3 bullets of most recent role -- verbs and outcomes match?
-4. Skills -- must-haves visible immediately?
+    return f"""You are tailoring a resume to a specific job. You are given the candidate's ORIGINAL resume content (summary, experience, and master skills list) and a target job description.
 
-## SKILLS BOUNDARY (real skills only):
-{skills_block}
+## HARD RULE -- REPHRASE ONLY, NEVER INVENT:
+Every bullet and the summary must describe ONLY work explicitly stated in the ORIGINAL RESUME you're given. You MAY:
+- Reword for clarity and conciseness (tighten grammar, vary verbs, remove filler) or use synonym terminology from the relevant job description.
+- Merge or split a bullet if it reads better, as long as no detail is added or lost.
+You MUST NOT:
+- Add any skill, tool, achievement, responsibility, or outcome not explicitly present in the original text.
+- Infer what someone in this kind of role "would have" or "must have" done. If it is not written in the original, it does not go in the output.
+- Invent or round numbers. Only these figures may appear: {metrics_str}.
 
-You MAY add 2-3 closely related tools (Kubernetes if Docker, Terraform if AWS, Redis if PostgreSQL). No unrelated languages/frameworks.
+## WHAT YOU MAY ADJUST FOR THIS JOB:
+- Professional summary: this is NOT a generic paragraph reused across jobs. Read the job description's title and its "What You'll Be Doing" / "What You Bring" content, and open the summary by positioning the candidate for THIS type of role, then pull forward the 2-3 pieces of original experience that most directly match what this specific posting asks for. Every clause you write must point to ONE specific bullet in the original experience below -- if you can't name which original bullet a sentence came from, cut it. Do NOT turn a single one-off instance into a general claim of ongoing practice (example: one feature project's requirements-gathering is NOT "experience translating feedback into requirements and service improvements" as a general capability -- describe only what was actually done, on the actual thing it was done for). A summary that would read equally well pasted into any other job posting is a failure -- it must be obviously written for this one, but every word must still survive the zero-tolerance fact-check below.
+- Experience: job scope and achievement bullets may be reworded to increase match with the job description, using its terminology, but every claim must remain true and traceable to the original -- never untrue.
+- Skills: choose the skills most relevant to this role, but ONLY from the candidate's master skills list given below. Pick 6-10, ordered most-relevant-to-this-posting first. Prioritize skills that map directly to phrases in the job description's requirements/responsibilities over generic ones that merely could apply.
 
-## TAILORING RULES:
-
-TITLE: Match the target role. Keep seniority (Senior/Lead/Staff). Drop company suffixes and team names.
-
-SUMMARY: Rewrite from scratch. Lead with the 1-2 skills that matter most for THIS role. Sound like someone who's done this job.
-
-SKILLS: Reorder each category so the job's must-haves appear first.
-
-Reframe EVERY bullet for this role. Same real work, different angle. Every bullet must be reworded. Never copy verbatim.
-
-PROJECTS: Reorder by relevance. Drop irrelevant projects entirely.
-
-BULLETS: Strong verb + what you built + quantified impact. Vary verbs (Built, Designed, Implemented, Reduced, Automated, Deployed, Operated, Optimized). Most relevant first. Max 4 per section.
+## WHAT NEVER CHANGES (copy exactly, verbatim, do not reword or translate):
+- Each experience entry's job title and its "Company - Location, Dates" line, from this list: {titles_str}.
+- Preserved companies: {companies_str} -- names stay as-is, every one must appear.
+- LANGUAGE HONESTY: if language skills come up anywhere, state them EXACTLY as: {languages_str}. Never overstate.
 
 ## VOICE:
-- Write like a real engineer. Short, direct.
-- GOOD: "Automated financial reporting with Python + API integrations, cut processing time from 10 hours to 2"
-- BAD: "Leveraged cutting-edge AI technologies to drive transformative operational efficiencies"
-- BANNED WORDS (using ANY of these = validation failure — do not use them even once):
-  {banned_str}
+- Write like a real professional. Short, direct.
+- BANNED WORDS (using ANY of these = validation failure -- do not use them even once): {banned_str}
 - No em dashes. Use commas, periods, or hyphens.
+- Never say "seasoned" or "seasoned professional".
 
-## HARD RULES:
-- Do NOT invent work, companies, degrees, or certifications
-- Do NOT change real numbers ({metrics_str})
-- Preserved companies: {companies_str} -- names stay as-is
-- Preserved school: {school}
-- Must fit 1 page.
+## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble. Return ALL experience entries given to you, in the same order, one JSON object per entry.
 
-## OUTPUT: Return ONLY valid JSON. No markdown fences. No commentary. No "here is" preamble.
-
-{{"title":"Role Title","summary":"2-3 tailored sentences.","skills":{{"Languages":"...","Frameworks":"...","DevOps & Infra":"...","Databases":"...","Tools":"..."}},"experience":[{{"header":"Title at Company","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2","bullet 3","bullet 4"]}}],"projects":[{{"header":"Project Name - Description","subtitle":"Tech | Dates","bullets":["bullet 1","bullet 2"]}}],"education":"{school} | {education_level}"}}"""
+{{"summary":"2-3 sentences.","experience":[{{"header":"exact title from original","company_line":"exact Company - Location, Dates from original","job_scope":["bullet 1"],"achievements":["bullet 1","bullet 2"]}}],"skills":["Skill A","Skill B"]}}"""
 
 
 def _build_judge_prompt(profile: dict) -> str:
-    """Build the LLM judge prompt from the user's profile."""
-    boundary = profile.get("skills_boundary", {})
+    """Zero-tolerance fact-checker for the per-job rephrase. Header, Projects,
+    Education, Software Skills, Languages, and Certifications never reach the
+    LLM at all, so this only ever needs to judge summary + experience bullets
+    + the skills subset."""
     resume_facts = profile.get("resume_facts", {})
-
-    # Flatten allowed skills for the judge
-    all_skills: list[str] = []
-    for items in boundary.values():
-        if isinstance(items, list):
-            all_skills.extend(items)
-    skills_str = ", ".join(all_skills) if all_skills else "N/A"
-
     real_metrics = resume_facts.get("real_metrics", [])
     metrics_str = ", ".join(real_metrics) if real_metrics else "N/A"
 
-    return f"""You are a resume quality judge. A tailoring engine rewrote a resume to target a specific job. Your job is to catch LIES, not style changes.
+    return f"""You are a resume fact-checker. A tailoring engine reworded a resume's summary and experience bullets, and picked a subset of skills, for a specific job. Your only job is to catch anything added, invented, or inferred that isn't explicitly in the original.
 
 You must answer with EXACTLY this format:
 VERDICT: PASS or FAIL
 ISSUES: (list any problems, or "none")
 
-## CONTEXT -- what the tailoring engine was instructed to do (all of this is ALLOWED):
-- Change the title to match the target role
-- Rewrite the summary from scratch for the target job
-- Reorder bullets and projects to put the most relevant first
-- Reframe bullets to use the job's language
-- Drop low-relevance bullets and replace with more relevant ones from other sections
-- Reorder the skills section to put job-relevant skills first
-- Change tone and wording extensively
+## ALLOWED:
+- Rewording bullets/summary for clarity, conciseness, or job-description terminology, as long as the underlying facts and scope are unchanged.
+- Reordering which point comes first.
+- Selecting a subset of skills from the candidate's master list.
 
-## WHAT IS FABRICATION (FAIL for these):
-1. Adding tools, languages, or frameworks to TECHNICAL SKILLS that aren't in the original. The allowed skills are ONLY: {skills_str}
-2. Inventing NEW metrics or numbers not in the original. The real metrics are: {metrics_str}
-3. Inventing work that has no basis in any original bullet (completely new achievements).
-4. Adding companies, roles, or degrees that don't exist.
-5. Changing real numbers (inflating 80% to 95%, 500 nodes to 1000 nodes).
+## FAIL FOR ANY OF THESE -- one instance is enough:
+1. Any skill, tool, achievement, responsibility, or outcome in the summary or a bullet that is NOT explicitly present in the original resume text below.
+2. Any claim inferred from "what someone in this role would typically do" rather than what the original text actually says.
+3. Inventing or changing a number. The only real metrics are: {metrics_str}.
+4. Any phrase implying more seniority, scope, or ownership than the original bullet states.
 
-## WHAT IS NOT FABRICATION (do NOT fail for these):
-- Rewording any bullet, even heavily, as long as the underlying work is real
-- Combining two original bullets into one
-- Splitting one original bullet into two
-- Describing the same work with different emphasis
-- Dropping bullets entirely
-- Reordering anything
-- Changing the title or summary completely
+## NOT A FAILURE:
+- Rewording that keeps the exact same facts and scope, even using job-posting terminology.
+- Reordering points, combining/splitting a bullet with no detail added or lost.
 
-## TOLERANCE RULE:
-The goal is to get interviews, not to be a perfect fact-checker. Allow up to 3 minor stretches per resume:
-- Adding a closely related tool the candidate could realistically know is a MINOR STRETCH, not fabrication.
-- Reframing a metric with slightly different wording is a MINOR STRETCH.
-- Adding any LEARNABLE skill given their existing stack is a MINOR STRETCH.
-- Only FAIL if there are MAJOR lies: completely invented projects, fake companies, fake degrees, wildly inflated numbers, or skills from a completely different domain.
-
-Be strict about major lies. Be lenient about minor stretches and learnable skills. Do not fail for style, tone, or restructuring."""
+Do not be lenient. If a claim isn't traceable to specific text in the original resume, it FAILS."""
 
 
 # ── JSON Extraction ───────────────────────────────────────────────────────
 
 def extract_json(raw: str) -> dict:
-    """Robustly extract JSON from LLM response (handles fences, preamble).
-
-    Args:
-        raw: Raw LLM response text.
-
-    Returns:
-        Parsed JSON dict.
-
-    Raises:
-        ValueError: If no valid JSON found.
-    """
+    """Robustly extract JSON from LLM response (handles fences, preamble)."""
     raw = raw.strip()
-
-    # Direct parse
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
         pass
 
-    # Markdown fences
     if "```" in raw:
         for part in raw.split("```")[1::2]:
             part = part.strip()
@@ -206,7 +242,6 @@ def extract_json(raw: str) -> dict:
             except json.JSONDecodeError:
                 continue
 
-    # Find outermost { ... }
     start = raw.find("{")
     end = raw.rfind("}")
     if start != -1 and end > start:
@@ -218,17 +253,70 @@ def extract_json(raw: str) -> dict:
     raise ValueError("No valid JSON found in LLM response")
 
 
-# ── Resume Assembly (profile-driven header) ──────────────────────────────
+# ── Deterministic safety nets (never trust the LLM alone for facts) ──────
 
-def assemble_resume_text(data: dict, profile: dict) -> str:
-    """Convert JSON resume data to formatted plain text.
+def _enforce_verbatim_facts(llm_experience: list, original_entries: list[dict]) -> list[dict]:
+    """Force header/company_line to match the original verbatim, positionally
+    -- these are facts, not phrasing, and must never drift regardless of what
+    the LLM returned. Falls back to the original bullets for any entry the
+    LLM dropped, reordered, or malformed.
+    """
+    result = []
+    for i, orig in enumerate(original_entries):
+        entry = llm_experience[i] if i < len(llm_experience) and isinstance(llm_experience[i], dict) else {}
+        job_scope = entry.get("job_scope")
+        achievements = entry.get("achievements")
+        result.append({
+            "header": orig["header"],
+            "company_line": orig["company_line"],
+            "job_scope": job_scope if isinstance(job_scope, list) and job_scope else orig["job_scope"],
+            "achievements": achievements if isinstance(achievements, list) and achievements else orig["achievements"],
+        })
+    return result
 
-    Header (name, location, contact) is ALWAYS code-injected from the profile,
-    never LLM-generated. All text fields are sanitized.
+
+def _enforce_skills_subset(llm_skills, master_skills: list[str]) -> list[str]:
+    """Keep only skills that are actually in the master list -- deterministic
+    guard against the LLM inventing or misspelling a skill. Falls back to the
+    full master list if nothing valid came back."""
+    if not isinstance(llm_skills, list):
+        return master_skills
+    master_lower = {s.lower(): s for s in master_skills}
+    result = [master_lower[s.lower()] for s in llm_skills if isinstance(s, str) and s.lower() in master_lower]
+    return result or master_skills
+
+
+# ── Resume Assembly ────────────────────────────────────────────────────────
+
+def _judge_scope_text(data: dict) -> str:
+    """The subset of a tailored resume the LLM actually influenced: summary,
+    experience bullets. Everything else is frozen/verbatim and was never
+    derived from the LLM in the first place."""
+    lines = ["SUMMARY", str(data.get("summary", "")), "", "EXPERIENCE"]
+    for entry in data.get("experience", []):
+        lines.append(str(entry.get("header", "")))
+        lines.extend(f"- {b}" for b in entry.get("job_scope", []))
+        lines.extend(f"- {b}" for b in entry.get("achievements", []))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def assemble_resume_text(data: dict, profile: dict, resume_text: str) -> str:
+    """Convert tailored JSON + frozen resume.txt sections into formatted text.
+
+    Header (name, contact) is code-injected from the profile. Experience
+    titles/company-lines are code-enforced verbatim (see
+    _enforce_verbatim_facts) -- only job_scope/achievements bullet wording
+    and the summary come from the LLM. Projects, Education, Software Skills,
+    Languages, and Certifications are extracted verbatim from resume.txt and
+    never touch the LLM at all.
 
     Args:
-        data: Parsed JSON resume from the LLM.
+        data: Tailored JSON (summary, experience, skills, role_title -- the
+              target job's own title, set by tailor_resume, code-injected
+              verbatim, never LLM-generated).
         profile: User profile dict from load_profile().
+        resume_text: The master resume text, for frozen-section extraction.
 
     Returns:
         Formatted resume text.
@@ -236,63 +324,85 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
     personal = profile.get("personal", {})
     lines: list[str] = []
 
-    # Header -- always code-injected from profile
+    # Header -- always code-injected from profile. Role title is the target
+    # job's own posted title, copied verbatim (zero fabrication risk) -- not
+    # an LLM-invented tagline. Contact line is label:value pairs so pdf.py
+    # can lay it out in two columns without re-parsing ambiguous strings.
     lines.append(personal.get("full_name", ""))
-    lines.append(sanitize_text(data.get("title", "Software Engineer")))
-
-    # Location from search config or profile -- leave blank if not available
-    # The location line is optional; the original used a hardcoded city.
-    # We omit it here; the LLM prompt can include it if the user sets it.
-
-    # Contact line
+    lines.append(str(data.get("role_title", "")))
     contact_parts: list[str] = []
     if personal.get("email"):
-        contact_parts.append(personal["email"])
+        contact_parts.append(f"Email: {personal['email']}")
     if personal.get("phone"):
-        contact_parts.append(personal["phone"])
-    if personal.get("github_url"):
-        contact_parts.append(personal["github_url"])
+        contact_parts.append(f"Phone: {personal['phone']}")
+    if personal.get("city") and personal.get("country"):
+        contact_parts.append(f"Location: {personal['city']}, {personal['country']}")
     if personal.get("linkedin_url"):
-        contact_parts.append(personal["linkedin_url"])
+        contact_parts.append(f"LinkedIn: {personal['linkedin_url']}")
+    if personal.get("github_url"):
+        contact_parts.append(f"GitHub: {personal['github_url']}")
     if contact_parts:
         lines.append(" | ".join(contact_parts))
     lines.append("")
 
     # Summary
-    lines.append("SUMMARY")
-    lines.append(sanitize_text(data["summary"]))
+    lines.append("PROFESSIONAL SUMMARY")
+    lines.append(sanitize_text(str(data.get("summary", ""))))
     lines.append("")
 
-    # Technical Skills
-    lines.append("TECHNICAL SKILLS")
-    if isinstance(data["skills"], dict):
-        for cat, val in data["skills"].items():
-            lines.append(f"{cat}: {sanitize_text(str(val))}")
-    lines.append("")
-
-    # Experience
-    lines.append("EXPERIENCE")
+    # Experience -- header/company_line code-enforced verbatim, bullets per-job
+    lines.append("PROFESSIONAL EXPERIENCE")
     for entry in data.get("experience", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+        lines.append(sanitize_text(str(entry.get("header", ""))))
+        lines.append(sanitize_text(str(entry.get("company_line", ""))))
+        for b in entry.get("job_scope", []):
+            lines.append(f"- {sanitize_text(str(b))}")
+        if entry.get("achievements"):
+            lines.append("Achievements:")
+            for b in entry["achievements"]:
+                lines.append(f"- {sanitize_text(str(b))}")
         lines.append("")
 
-    # Projects
-    lines.append("PROJECTS")
-    for entry in data.get("projects", []):
-        lines.append(sanitize_text(entry.get("header", "")))
-        if entry.get("subtitle"):
-            lines.append(sanitize_text(entry["subtitle"]))
-        for b in entry.get("bullets", []):
-            lines.append(f"- {sanitize_text(b)}")
+    # Projects -- frozen, verbatim, never LLM-touched
+    projects_text = extract_resume_section(resume_text, "PROJECTS")
+    if projects_text:
+        lines.append("PROJECTS")
+        lines.append(projects_text)
         lines.append("")
 
-    # Education
+    # Education -- frozen, verbatim, never LLM-touched
     lines.append("EDUCATION")
-    lines.append(sanitize_text(str(data.get("education", ""))))
+    education_text = extract_resume_section(resume_text, "EDUCATION")
+    if education_text:
+        lines.append(education_text)
+    lines.append("")
+
+    # Skills -- per-job relevant subset of the master list
+    skills = data.get("skills", [])
+    if skills:
+        lines.append("SKILLS")
+        lines.append(" | ".join(skills))
+        lines.append("")
+
+    # Software Skills -- frozen, verbatim, never LLM-touched
+    software_skills_text = extract_resume_section(resume_text, "SOFTWARE SKILLS")
+    if software_skills_text:
+        lines.append("SOFTWARE SKILLS")
+        lines.append(software_skills_text)
+        lines.append("")
+
+    # Languages -- frozen, verbatim, never LLM-touched
+    languages_text = extract_resume_section(resume_text, "LANGUAGES")
+    if languages_text:
+        lines.append("LANGUAGES")
+        lines.append(languages_text)
+        lines.append("")
+
+    # Certifications -- frozen, verbatim, never LLM-touched
+    certifications_text = extract_resume_section(resume_text, "CERTIFICATIONS")
+    if certifications_text:
+        lines.append("CERTIFICATIONS")
+        lines.append(certifications_text)
 
     return "\n".join(lines)
 
@@ -302,17 +412,7 @@ def assemble_resume_text(data: dict, profile: dict) -> str:
 def judge_tailored_resume(
     original_text: str, tailored_text: str, job_title: str, profile: dict
 ) -> dict:
-    """LLM judge layer: catches subtle fabrication that programmatic checks miss.
-
-    Args:
-        original_text: Base resume text.
-        tailored_text: Tailored resume text.
-        job_title: Target job title.
-        profile: User profile for building the judge prompt.
-
-    Returns:
-        {"passed": bool, "verdict": str, "issues": str, "raw": str}
-    """
+    """LLM judge layer: catches subtle fabrication that programmatic checks miss."""
     judge_prompt = _build_judge_prompt(profile)
 
     messages = [
@@ -348,30 +448,35 @@ def tailor_resume(
     resume_text: str, job: dict, profile: dict,
     max_retries: int = 3, validation_mode: str = "normal",
 ) -> tuple[str, dict]:
-    """Generate a tailored resume via JSON output + fresh context on each retry.
-
-    Key design choices:
-    - LLM returns structured JSON, code assembles the text (no header leaks)
-    - Each retry starts a FRESH conversation (no apologetic spiral)
-    - Issues from previous attempts are noted in the system prompt
-    - Em dashes and smart quotes are auto-fixed, not rejected
+    """Generate a tailored resume for one job: a fresh, grounded rephrase of
+    resume.txt's Summary, Experience bullets, and a relevant Skills subset.
+    Every other section is frozen/verbatim. Each retry starts a FRESH
+    conversation (no apologetic spiral).
 
     Args:
-        resume_text:      Base resume text.
-        job:              Job dict with title, site, location, full_description.
-        profile:          User profile dict.
-        max_retries:      Maximum retry attempts.
-        validation_mode:  "strict", "normal", or "lenient".
-                          strict  -- banned words trigger retries; judge must pass
-                          normal  -- banned words = warnings only; judge can fail on last retry
-                          lenient -- banned words ignored; LLM judge skipped
+        resume_text:      Master resume text (read fresh, not cached).
+        job:               Job dict with title, company, location, full_description.
+        profile:           User profile dict.
+        max_retries:       Maximum retry attempts.
+        validation_mode:   "strict", "normal", or "lenient".
 
     Returns:
         (tailored_text, report) where report contains validation details.
     """
+    original_summary = extract_summary(resume_text)
+    original_entries = parse_experience_entries(resume_text)
+    master_skills = extract_skills_list(resume_text)
+
+    original_context = (
+        f"ORIGINAL SUMMARY:\n{original_summary}\n\n"
+        f"ORIGINAL EXPERIENCE:\n{json.dumps(original_entries, indent=2)}\n\n"
+        f"MASTER SKILLS LIST (choose a subset ONLY from these, never add anything else):\n"
+        f"{' | '.join(master_skills)}"
+    )
+
     job_text = (
         f"TITLE: {job['title']}\n"
-        f"COMPANY: {job['site']}\n"
+        f"COMPANY: {job.get('company') or 'Unknown'}\n"
         f"LOCATION: {job.get('location', 'N/A')}\n\n"
         f"DESCRIPTION:\n{(job.get('full_description') or '')[:6000]}"
     )
@@ -383,13 +488,12 @@ def tailor_resume(
     avoid_notes: list[str] = []
     tailored = ""
     client = get_client()
-    tailor_prompt_base = _build_tailor_prompt(profile)
+    prompt_base = _build_tailor_prompt(profile)
 
     for attempt in range(max_retries + 1):
         report["attempts"] = attempt + 1
 
-        # Fresh conversation every attempt
-        prompt = tailor_prompt_base
+        prompt = prompt_base
         if avoid_notes:
             prompt += "\n\n## AVOID THESE ISSUES (from previous attempt):\n" + "\n".join(
                 f"- {n}" for n in avoid_notes[-5:]
@@ -397,55 +501,54 @@ def tailor_resume(
 
         messages = [
             {"role": "system", "content": prompt},
-            {"role": "user", "content": f"ORIGINAL RESUME:\n{resume_text}\n\n---\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
+            {"role": "user", "content": f"{original_context}\n\nTARGET JOB:\n{job_text}\n\nReturn the JSON:"},
         ]
 
         raw = client.chat(messages, max_tokens=2048, temperature=0.4)
 
-        # Parse JSON from response
         try:
             data = extract_json(raw)
         except ValueError:
             avoid_notes.append("Output was not valid JSON. Return ONLY a JSON object, nothing else.")
             continue
 
-        # Layer 1: Validate JSON fields
+        if not data.get("summary") or not data.get("experience"):
+            avoid_notes.append("Missing required field: summary or experience")
+            continue
+
+        # Deterministic guards -- facts are code-enforced, never trusted from the LLM alone
+        data["experience"] = _enforce_verbatim_facts(data.get("experience"), original_entries)
+        data["skills"] = _enforce_skills_subset(data.get("skills"), master_skills)
+        data["role_title"] = job.get("title", "")
+
         validation = validate_json_fields(data, profile, mode=validation_mode)
         report["validator"] = validation
 
         if not validation["passed"]:
-            # Only retry if there are hard errors (warnings never block)
             avoid_notes.extend(validation["errors"])
             if attempt < max_retries:
                 continue
-            # Last attempt — assemble whatever we got
-            tailored = assemble_resume_text(data, profile)
+            tailored = assemble_resume_text(data, profile, resume_text)
             report["status"] = "failed_validation"
             return tailored, report
 
-        # Assemble text (header injected by code, em dashes auto-fixed)
-        tailored = assemble_resume_text(data, profile)
+        tailored = assemble_resume_text(data, profile, resume_text)
 
-        # Layer 2: LLM judge (catches subtle fabrication) — skipped in lenient mode
         if validation_mode == "lenient":
             report["judge"] = {"verdict": "SKIPPED", "passed": True, "issues": "none"}
             report["status"] = "approved"
             return tailored, report
 
-        judge = judge_tailored_resume(resume_text, tailored, job.get("title", ""), profile)
+        judge = judge_tailored_resume(resume_text, _judge_scope_text(data), job.get("title", ""), profile)
         report["judge"] = judge
 
         if not judge["passed"]:
             avoid_notes.append(f"Judge rejected: {judge['issues']}")
             if attempt < max_retries:
-                # In normal mode, only retry on judge failure if there are retries left
-                if validation_mode != "lenient":
-                    continue
-            # Accept best attempt on last retry (all modes) or if lenient
+                continue
             report["status"] = "approved_with_judge_warning"
             return tailored, report
 
-        # Both passed
         report["status"] = "approved"
         return tailored, report
 
@@ -456,13 +559,17 @@ def tailor_resume(
 # ── Batch Entry Point ────────────────────────────────────────────────────
 
 def run_tailoring(min_score: int = 7, limit: int = 20,
-                  validation_mode: str = "normal") -> dict:
+                  validation_mode: str = "normal",
+                  job_urls: list[str] | None = None) -> dict:
     """Generate tailored resumes for high-scoring jobs.
 
     Args:
         min_score:       Minimum fit_score to tailor for.
         limit:           Maximum jobs to process.
         validation_mode: "strict", "normal", or "lenient".
+        job_urls:        If given, process exactly these URLs (any current
+                         fit_score, ignores the geo quota) instead of
+                         selecting new candidates.
 
     Returns:
         {"approved": int, "failed": int, "errors": int, "elapsed": float}
@@ -471,11 +578,41 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
     resume_text = RESUME_PATH.read_text(encoding="utf-8")
     conn = get_connection()
 
-    jobs = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=limit)
+    if job_urls:
+        placeholders = ",".join("?" * len(job_urls))
+        rows = conn.execute(f"SELECT * FROM jobs WHERE url IN ({placeholders})", job_urls).fetchall()
+        columns = rows[0].keys() if rows else []
+        jobs = [dict(zip(columns, row)) for row in rows]
+    else:
+        all_candidates = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=0)
+        jobs = select_with_quota(all_candidates, limit)
 
     if not jobs:
         log.info("No untailored jobs with score >= %d.", min_score)
         return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
+
+    # Live freshness re-check: catches newly-closed listings and cross-checks
+    # the apply URL against the real destination site before spending an LLM
+    # call. See enrichment.detail.recheck_jobs.
+    from applypilot.enrichment.detail import recheck_jobs
+    recheck_stats = recheck_jobs([j["url"] for j in jobs])
+    if recheck_stats.get("expired"):
+        log.info("Live recheck: %d/%d shortlisted jobs are already closed -- skipping them.",
+                 recheck_stats["expired"], len(jobs))
+        if job_urls:
+            placeholders = ",".join("?" * len(job_urls))
+            rows = conn.execute(
+                f"SELECT * FROM jobs WHERE url IN ({placeholders}) "
+                "AND (detail_error IS NULL OR detail_error != 'expired')", job_urls,
+            ).fetchall()
+            columns = rows[0].keys() if rows else []
+            jobs = [dict(zip(columns, row)) for row in rows]
+        else:
+            all_candidates = get_jobs_by_stage(conn=conn, stage="pending_tailor", min_score=min_score, limit=0)
+            jobs = select_with_quota(all_candidates, limit)
+        if not jobs:
+            log.info("No untailored jobs left after live recheck.")
+            return {"approved": 0, "failed": 0, "errors": 0, "elapsed": 0.0}
 
     TAILORED_DIR.mkdir(parents=True, exist_ok=True)
     log.info("Tailoring resumes for %d jobs (score >= %d)...", len(jobs), min_score)
@@ -490,20 +627,17 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             tailored, report = tailor_resume(resume_text, job, profile,
                                              validation_mode=validation_mode)
 
-            # Build safe filename prefix
             safe_title = re.sub(r"[^\w\s-]", "", job["title"])[:50].strip().replace(" ", "_")
             safe_site = re.sub(r"[^\w\s-]", "", job["site"])[:20].strip().replace(" ", "_")
             prefix = f"{safe_site}_{safe_title}"
 
-            # Save tailored resume text
             txt_path = TAILORED_DIR / f"{prefix}.txt"
             txt_path.write_text(tailored, encoding="utf-8")
 
-            # Save job description for traceability
             job_path = TAILORED_DIR / f"{prefix}_JOB.txt"
             job_desc = (
                 f"Title: {job['title']}\n"
-                f"Company: {job['site']}\n"
+                f"Company: {job.get('company') or 'Unknown'}\n"
                 f"Location: {job.get('location', 'N/A')}\n"
                 f"Score: {job.get('fit_score', 'N/A')}\n"
                 f"URL: {job['url']}\n\n"
@@ -511,12 +645,9 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             )
             job_path.write_text(job_desc, encoding="utf-8")
 
-            # Save validation report
             report_path = TAILORED_DIR / f"{prefix}_REPORT.json"
             report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-            # Generate PDF for approved resumes (best-effort)
-            # "approved_with_judge_warning" is also a success — resume was generated.
             pdf_path = None
             if report["status"] in ("approved", "approved_with_judge_warning"):
                 try:
@@ -534,6 +665,10 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
                 "status": report["status"],
                 "attempts": report["attempts"],
             }
+        except LLMCircuitOpenError as e:
+            completed -= 1  # this job never actually got processed
+            log.error("Aborting tailoring after %d/%d jobs -- %s", completed, len(jobs), e)
+            break
         except Exception as e:
             result = {
                 "url": job["url"], "title": job["title"], "site": job["site"],
@@ -555,7 +690,6 @@ def run_tailoring(min_score: int = 7, limit: int = 20,
             result["title"][:40],
         )
 
-    # Persist to DB: increment attempt counter for ALL, save path only for approved
     now = datetime.now(timezone.utc).isoformat()
     _success_statuses = {"approved", "approved_with_judge_warning"}
     for r in results:

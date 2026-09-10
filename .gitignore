@@ -5,6 +5,19 @@ resume.pdf
 *.env
 .env.*
 !.env.example
+*.jpeg
+*.jpg
+*.png
+
+# Ad-hoc scratch/debug scripts -- these tend to hardcode local paths and
+# credentials; keep them out of the repo entirely.
+debug_*.py
+gen_*.py
+regen_*.py
+test_model.py
+scratch_*.py
+*_utils.py
+applypilot_utils.py
 
 # Runtime artifacts
 *.db

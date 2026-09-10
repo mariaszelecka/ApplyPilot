@@ -13,6 +13,7 @@ DB_PATH = APP_DIR / "applypilot.db"
 PROFILE_PATH = APP_DIR / "profile.json"
 RESUME_PATH = APP_DIR / "resume.txt"
 RESUME_PDF_PATH = APP_DIR / "resume.pdf"
+COVER_LETTER_EXAMPLES_PATH = APP_DIR / "cover_letter_examples.txt"
 SEARCH_CONFIG_PATH = APP_DIR / "searches.yaml"
 ENV_PATH = APP_DIR / ".env"
 
@@ -149,6 +150,12 @@ def load_blocked_sso() -> list[str]:
     """Load blocked SSO domains from sites.yaml."""
     cfg = load_sites_config()
     return cfg.get("blocked_sso", [])
+
+
+def load_known_ats_domains() -> list[str]:
+    """Load known shared-ATS login domains (Greenhouse, Lever, Workday, etc.) from sites.yaml."""
+    cfg = load_sites_config()
+    return cfg.get("known_ats_domains", [])
 
 
 def load_base_urls() -> dict[str, str | None]:

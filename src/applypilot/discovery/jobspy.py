@@ -1,4 +1,4 @@
-"""JobSpy-based job discovery: searches Indeed, LinkedIn, Glassdoor, ZipRecruiter.
+"""JobSpy-based job discovery: searches Indeed, LinkedIn.
 
 Uses python-jobspy to scrape multiple job boards, deduplicates results,
 parses salary ranges, and stores everything in the ApplyPilot database.
@@ -8,6 +8,7 @@ search configuration YAML (searches.yaml) rather than being hardcoded.
 """
 
 import logging
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -16,6 +17,8 @@ from jobspy import scrape_jobs
 
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
+from applypilot.discovery.freshness import looks_expired
+from applypilot.scoring.scorer import is_consulting_manager_title, is_senior_title
 
 log = logging.getLogger(__name__)
 
@@ -86,6 +89,47 @@ def _load_location_config(search_cfg: dict) -> tuple[list[str], list[str]]:
     return accept, reject
 
 
+# Region keyword groups: matched against a search's own `location` field to
+# derive (a) which Indeed country code to query and (b) which location
+# strings should be accepted when filtering results. Keyed by a keyword that
+# must appear in the search's location string (lowercased).
+_REGION_MAP: list[tuple[str, str, list[str]]] = [
+    # (keyword-to-match-in-search-location, indeed_country_code, accept_locations)
+    ("switzerland", "switzerland",
+     ["switzerland", "zurich", "zürich", "zug", "basel", "bern", "st. gallen", "lausanne", "winterthur", "geneva"]),
+    ("zurich", "switzerland",
+     ["switzerland", "zurich", "zürich", "zug", "basel", "bern", "st. gallen", "lausanne", "winterthur", "geneva"]),
+    ("united kingdom", "uk", ["united kingdom", "london", "uk", "england"]),
+    ("london", "uk", ["united kingdom", "london", "uk", "england"]),
+    ("ireland", "ireland", ["ireland", "dublin"]),
+    ("dublin", "ireland", ["ireland", "dublin"]),
+    ("monaco", "france", ["monaco", "nice", "france", "côte d'azur", "cote d'azur"]),
+    ("nice", "france", ["nice", "monaco", "france", "côte d'azur", "cote d'azur"]),
+    ("france", "france", ["france", "nice", "monaco", "côte d'azur", "cote d'azur"]),
+    ("san francisco", "usa", ["san francisco", "silicon valley", "bay area", "california", "usa", "united states"]),
+    ("silicon valley", "usa", ["san francisco", "silicon valley", "bay area", "california", "usa", "united states"]),
+    ("california", "usa", ["san francisco", "silicon valley", "bay area", "california", "usa", "united states"]),
+    ("united states", "usa", ["usa", "united states"]),
+]
+
+
+def _infer_region(location: str) -> tuple[str, list[str]]:
+    """Infer (indeed_country_code, accept_locations) from a search's location string.
+
+    Falls back to the bare city/country name as both the country code guess
+    and the sole accept pattern when no known region matches -- better to
+    under-filter an unrecognized location than to silently drop it.
+    """
+    loc_lower = (location or "").lower()
+    for keyword, country_code, accept in _REGION_MAP:
+        if keyword in loc_lower:
+            return country_code, accept
+    fallback = [p.strip() for p in loc_lower.split(",") if p.strip()]
+    return (fallback[-1] if fallback else "usa"), (fallback or [loc_lower])
+
+
+
+
 def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> bool:
     """Check if a job location passes the user's location filter.
 
@@ -117,11 +161,36 @@ def _location_ok(location: str | None, accept: list[str], reject: list[str]) -> 
 
 # -- DB storage (JobSpy DataFrame -> SQLite) ---------------------------------
 
+def _dedup_key(title: str | None, company: str | None) -> str | None:
+    """Normalized (title, company) signature for cross-site duplicate
+    detection. The same posting scraped from LinkedIn vs. Indeed gets
+    completely different URLs (so the url UNIQUE constraint never catches
+    it) and often differently-formatted locations ("Zurich, Zurich,
+    Switzerland" vs. "Zürich, ZH, CH (Remote)") -- but title and company are
+    reliably the same, so that's the dedup signal instead of location."""
+    if not title or not company:
+        return None
+    t = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", title.lower())).strip()
+    c = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", company.lower())).strip()
+    if not t or not c:
+        return None
+    return f"{t}|{c}"
+
+
 def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tuple[int, int]:
     """Store JobSpy DataFrame results into the DB. Returns (new, existing)."""
     now = datetime.now(timezone.utc).isoformat()
     new = 0
     existing = 0
+
+    # Preload existing (title, company) signatures once so a job already in
+    # the DB under a different site's URL doesn't get inserted again as a
+    # near-identical duplicate under a new URL.
+    seen_keys: set[str] = set()
+    for t, c in conn.execute("SELECT title, company FROM jobs").fetchall():
+        key = _dedup_key(t, c)
+        if key:
+            seen_keys.add(key)
 
     for _, row in df.iterrows():
         url = str(row.get("job_url", ""))
@@ -131,6 +200,11 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
         title = str(row.get("title", "")) if str(row.get("title", "")) != "nan" else None
         company = str(row.get("company", "")) if str(row.get("company", "")) != "nan" else None
         location_str = str(row.get("location", "")) if str(row.get("location", "")) != "nan" else None
+
+        dedup_key = _dedup_key(title, company)
+        if dedup_key and dedup_key in seen_keys:
+            existing += 1
+            continue
 
         # Build salary string from min/max
         salary = None
@@ -156,25 +230,45 @@ def store_jobspy_results(conn: sqlite3.Connection, df, source_label: str) -> tup
 
         strategy = "jobspy"
 
-        # If JobSpy gave us a full description, promote it directly
+        # If JobSpy gave us a full description, promote it directly -- but
+        # still run the cheap text-based expiry check against it. This is a
+        # snapshot from scrape time, not a guarantee the posting is still
+        # open; the tailoring stage does a live re-check on top of this
+        # (see enrichment.detail.recheck_jobs) for the shortlist that
+        # actually matters, since we can't afford a real page visit for
+        # every one of these at discovery time.
         full_description = None
         detail_scraped_at = None
+        detail_error = None
         if description and len(description) > 200:
             full_description = description
             detail_scraped_at = now
+            if looks_expired(description):
+                detail_error = "expired"
 
-        # Extract apply URL if JobSpy provided it
-        apply_url = str(row.get("job_url_direct", "")) if str(row.get("job_url_direct", "")) != "nan" else None
+        # Extract apply URL if JobSpy provided it. Some rows have
+        # job_url_direct as a genuine Python None (not pandas NaN) -- blindly
+        # stringifying with str() before checking turns that into the literal
+        # text "None", which passes any "!= 'nan'" check and gets stored as a
+        # real (wrong) value instead of SQL NULL. Check the raw value first.
+        raw_apply_url = row.get("job_url_direct")
+        apply_url = None
+        if raw_apply_url is not None:
+            candidate = str(raw_apply_url).strip()
+            if candidate and candidate.lower() not in ("nan", "none", "null"):
+                apply_url = candidate
 
         try:
             conn.execute(
-                "INSERT INTO jobs (url, title, salary, description, location, site, strategy, discovered_at, "
-                "full_description, application_url, detail_scraped_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (url, title, salary, description, location_str, site_label, strategy, now,
-                 full_description, apply_url, detail_scraped_at),
+                "INSERT INTO jobs (url, title, company, salary, description, location, site, strategy, discovered_at, "
+                "full_description, application_url, detail_scraped_at, detail_error) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (url, title, company, salary, description, location_str, site_label, strategy, now,
+                 full_description, apply_url, detail_scraped_at, detail_error),
             )
             new += 1
+            if dedup_key:
+                seen_keys.add(dedup_key)
         except sqlite3.IntegrityError:
             existing += 1
 
@@ -221,6 +315,8 @@ def _run_one_search(
             "country_indeed": defaults.get("country_indeed", "usa"),
             "verbose": 0,
         }
+        if s.get("distance"):
+            kwargs["distance"] = s["distance"]
         if s.get("remote"):
             kwargs["is_remote"] = True
         if proxy_config:
@@ -276,15 +372,47 @@ def _run_one_search(
     ), axis=1)]
     filtered = before - len(df)
 
+    # Entry-level prefilter: drop senior/lead/director-level LinkedIn postings,
+    # plus "Manager"-titled postings at major consulting firms (a senior,
+    # experienced-hire grade there specifically -- see scorer.py).
+    before_senior = len(df)
+    if "site" in df.columns:
+        df = df[~df.apply(
+            lambda row: str(row.get("site", "")).lower() == "linkedin"
+            and (
+                is_senior_title(str(row.get("title", "")))
+                or is_consulting_manager_title(str(row.get("title", "")), str(row.get("company", "")))
+            ),
+            axis=1,
+        )]
+    senior_filtered = before_senior - len(df)
+
+    # Safety-net recency filter: LinkedIn's own f_TPR server-side filter isn't
+    # always exact (renewed/reposted listings can slip through), so also check
+    # the actual date_posted JobSpy returns. date_posted is day-granularity, so
+    # allow a 1-day buffer to avoid rejecting jobs posted earlier today.
+    stale = 0
+    if hours_old and "date_posted" in df.columns:
+        import math
+        from datetime import date, timedelta
+        cutoff = date.today() - timedelta(days=math.ceil(hours_old / 24) + 1)
+        before_recency = len(df)
+        df = df[df["date_posted"].isna() | (df["date_posted"] >= cutoff)]
+        stale = before_recency - len(df)
+
     conn = get_connection()
     new, existing = store_jobspy_results(conn, df, s["query"])
 
     msg = f"[{label}] {before} results -> {new} new, {existing} dupes"
     if filtered:
         msg += f", {filtered} filtered (location)"
+    if senior_filtered:
+        msg += f", {senior_filtered} filtered (senior title, LinkedIn)"
+    if stale:
+        msg += f", {stale} filtered (stale, >{hours_old}h old)"
     log.info(msg)
 
-    return {"new": new, "existing": existing, "errors": 0, "filtered": filtered, "total": before, "label": label}
+    return {"new": new, "existing": existing, "errors": 0, "filtered": filtered + senior_filtered, "total": before, "label": label}
 
 
 # -- Single query search -----------------------------------------------------
@@ -353,6 +481,72 @@ def search_jobs(
     log.info("DB total: %d jobs, %d pending detail scrape", db_total, pending)
 
     return {"total": total, "new": new, "existing": existing}
+
+
+# -- Region expansion (cities x roles) ---------------------------------------
+
+def _normalize_searches(cfg: dict) -> list[dict]:
+    """Expand `regions:` (cities x roles) and normalize `searches:` into one
+    flat list of per-search dicts, each with a resolved country_indeed code
+    and accept_locs list ready for _run_one_search.
+    """
+    default_hours_old = cfg.get("defaults", {}).get("hours_old", 72)
+    normalized: list[dict] = []
+
+    for region in cfg.get("regions", []):
+        # `enabled: false` pauses a region without deleting its config, so
+        # reactivating it later is a one-line change. Paused regions must
+        # stay in sync with scoring.region_quota's paused buckets -- there's
+        # no point crawling a region whose jobs can never be selected.
+        if not region.get("enabled", True):
+            log.info("Region '%s' is paused (enabled: false) -- skipping its searches.",
+                     region.get("name", "?"))
+            continue
+
+        cities = region.get("cities", [])
+        roles = region.get("roles", [])
+        if not cities or not roles:
+            continue
+
+        # Accept locations span the whole region (a result near one region
+        # city should still be accepted even if it was found via a search
+        # centered on a different city in the same region).
+        country_code, _ = _infer_region(cities[0])
+        accept_locs: set[str] = set()
+        for city in cities:
+            accept_locs.add(city.split(",")[0].strip().lower())
+            _, city_accept = _infer_region(city)
+            accept_locs.update(city_accept)
+
+        for city in cities:
+            for role in roles:
+                normalized.append({
+                    "search_term": role,
+                    "location": city,
+                    "distance": region.get("distance", 50),
+                    "hours_old": region.get("hours_old", default_hours_old),
+                    "results_wanted": region.get("results_wanted", 8),
+                    "site_name": region.get("site_name", ["linkedin", "indeed"]),
+                    "country_indeed": region.get("country_indeed", country_code),
+                    "accept_locs": sorted(accept_locs),
+                })
+
+    for s in cfg.get("searches", []):
+        location = s.get("location", "")
+        country_code, accept_locs = _infer_region(location)
+        normalized.append({
+            "search_term": s["search_term"],
+            "location": location,
+            "distance": s.get("distance"),
+            "hours_old": s.get("hours_old", default_hours_old),
+            "results_wanted": s.get("results_wanted", 20),
+            "site_name": s.get("site_name", ["linkedin", "indeed"]),
+            "country_indeed": s.get("country_indeed", country_code),
+            "accept_locs": accept_locs,
+            "is_remote": s.get("is_remote", False),
+        })
+
+    return normalized
 
 
 # -- Full crawl (all queries x all locations) --------------------------------
@@ -448,28 +642,27 @@ def run_discovery(cfg: dict | None = None) -> dict:
         log.warning("No search configuration found. Run `applypilot init` to create one.")
         return {"new": 0, "existing": 0, "errors": 0, "db_total": 0, "queries": 0}
 
-    # Support new flat `searches:` format
-    if "searches" in cfg:
-        searches_list = cfg["searches"]
+    # Support the `regions:` format (cities x roles, auto-expanded) and the
+    # flat `searches:` format (one explicit location per entry). Both may be
+    # present at once; results are combined into one normalized list.
+    if "regions" in cfg or "searches" in cfg:
+        normalized = _normalize_searches(cfg)
         proxy = cfg.get("proxy")
         proxy_config = parse_proxy(proxy) if proxy else None
         init_db()
         total_new = total_existing = total_errors = 0
 
-        for s in searches_list:
-            site_names = s.get("site_name", ["linkedin", "indeed"])
-            # Map searches format to _run_one_search format
+        for s in normalized:
             search = {
                 "query": s["search_term"],
-                "location": s.get("location", ""),
+                "location": s["location"],
                 "remote": s.get("is_remote", False),
+                "distance": s.get("distance"),
             }
-            defaults = {"country_indeed": "switzerland"}
+            defaults = {"country_indeed": s["country_indeed"]}
             result = _run_one_search(
-                search, site_names,
-                s.get("results_wanted", 20),
-                cfg.get("defaults", {}).get("hours_old", 72),
-                proxy_config, defaults, 2, ["switzerland", "zurich", "zug", "basel", "bern", "st. gallen", "lausanne", 			        "winterthur"], [], {},
+                search, s["site_name"], s["results_wanted"], s["hours_old"],
+                proxy_config, defaults, 2, s["accept_locs"], [], {},
             )
             total_new += result["new"]
             total_existing += result["existing"]
@@ -477,8 +670,8 @@ def run_discovery(cfg: dict | None = None) -> dict:
 
         conn = get_connection()
         db_total = conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-        log.info("Full crawl complete: %d new | %d dupes | %d errors | %d total in DB",
-                 total_new, total_existing, total_errors, db_total)
+        log.info("Full crawl complete: %d new | %d dupes | %d errors | %d total in DB (%d searches run)",
+                 total_new, total_existing, total_errors, db_total, len(normalized))
         return {"new": total_new, "existing": total_existing,
                 "errors": total_errors, "db_total": db_total}
 

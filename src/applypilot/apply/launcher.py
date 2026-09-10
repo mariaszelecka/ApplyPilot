@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -27,6 +28,7 @@ from applypilot import config
 from applypilot.database import get_connection
 from applypilot.apply import chrome, dashboard, prompt as prompt_mod
 from applypilot.apply.chrome import (
+    find_free_cdp_port,
     launch_chrome, cleanup_worker, kill_all_chrome,
     reset_worker_dir, cleanup_on_exit, _kill_process_tree,
     BASE_CDP_PORT,
@@ -42,6 +44,32 @@ logger = logging.getLogger(__name__)
 def _load_blocked():
     from applypilot.config import load_blocked_sites
     return load_blocked_sites()
+
+
+_CLAUDE_EXE: str | None = None
+
+
+def _resolve_claude_exe() -> str:
+    """Resolve the 'claude' CLI to its full executable path.
+
+    On Windows, npm installs it as a claude.cmd shim. subprocess.Popen(["claude", ...])
+    with shell=False goes straight to CreateProcess, which -- unlike a real shell --
+    does not try PATHEXT extensions, so the bare name fails with WinError 2 even
+    though `claude` resolves fine interactively. shutil.which() does the same PATHEXT
+    search a shell would and returns the concrete path, which CreateProcess can launch
+    directly without needing shell=True (which would complicate the stdin/stdout piping
+    this module relies on for streaming JSON).
+    """
+    global _CLAUDE_EXE
+    if _CLAUDE_EXE is None:
+        resolved = shutil.which("claude")
+        if not resolved:
+            raise RuntimeError(
+                "Could not find 'claude' on PATH. Ensure the Claude Code CLI is installed "
+                "and available (e.g. `npm install -g @anthropic-ai/claude-code`)."
+            )
+        _CLAUDE_EXE = resolved
+    return _CLAUDE_EXE
 
 # How often to poll the DB when the queue is empty (seconds)
 POLL_INTERVAL = config.DEFAULTS["poll_interval"]
@@ -63,6 +91,16 @@ if platform.system() != "Windows":
 # MCP config
 # ---------------------------------------------------------------------------
 
+# Pinned, not "@latest". With @latest, npx re-resolves the package against the
+# npm registry on every single apply attempt, so a momentary registry or network
+# blip means the MCP server never starts -- and the agent then runs with NO
+# browser tools at all, which looks like a mysterious application failure rather
+# than a network error. Seen in practice: Chrome launches, the CV is tailored,
+# and the agent aborts because browser_navigate doesn't exist. A pinned
+# version resolves from the local npx cache instead.
+_PLAYWRIGHT_MCP_VERSION = "0.0.80"
+
+
 def _make_mcp_config(cdp_port: int) -> dict:
     """Build MCP config dict for a specific CDP port."""
     return {
@@ -70,7 +108,7 @@ def _make_mcp_config(cdp_port: int) -> dict:
             "playwright": {
                 "command": "npx",
                 "args": [
-                    "@playwright/mcp@latest",
+                    f"@playwright/mcp@{_PLAYWRIGHT_MCP_VERSION}",
                     f"--cdp-endpoint=http://localhost:{cdp_port}",
                     f"--viewport-size={config.DEFAULTS['viewport']}",
                 ],
@@ -88,13 +126,20 @@ def _make_mcp_config(cdp_port: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def acquire_job(target_url: str | None = None, min_score: int = 7,
-                worker_id: int = 0) -> dict | None:
+                worker_id: int = 0, dry_run: bool = False) -> dict | None:
     """Atomically acquire the next job to apply to.
 
     Args:
         target_url: Apply to a specific URL instead of picking from queue.
         min_score: Minimum fit_score threshold.
         worker_id: Worker claiming this job (for tracking).
+        dry_run: If True, pull from the review queue (apply_status IS NULL
+            or 'failed' -- same pool as before). If False, this is a REAL,
+            submitting run: only jobs a human has explicitly approved
+            (apply_status='approved', set via `applypilot apply --approve`)
+            are eligible. This is the actual enforcement of "never apply
+            without approval" -- a live run cannot reach a job that hasn't
+            been through a --dry-run review pass and been approved.
 
     Returns:
         Job dict or None if the queue is empty.
@@ -104,16 +149,34 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
         conn.execute("BEGIN IMMEDIATE")
 
         if target_url:
-            like = f"%{target_url.split('?')[0].rstrip('/')}%"
-            row = conn.execute("""
-                SELECT url, title, site, application_url, tailored_resume_path,
+            status_clause = "" if dry_run else "AND apply_status = 'approved'"
+            # Exact match first. Aggregator sites (Indeed, etc.) share one
+            # base path across every posting and only differ by a query
+            # param (e.g. ?jk=...), so a same-site LIKE fallback on the
+            # query-stripped base path can match a *different* approved job
+            # -- only fall back to that loose match if nothing exact is found.
+            row = conn.execute(f"""
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
-                WHERE (url = ? OR application_url = ? OR application_url LIKE ? OR url LIKE ?)
+                WHERE (url = ? OR application_url = ?)
                   AND tailored_resume_path IS NOT NULL
                   AND apply_status != 'in_progress'
+                  {status_clause}
                 LIMIT 1
-            """, (target_url, target_url, like, like)).fetchone()
+            """, (target_url, target_url)).fetchone()
+            if row is None:
+                like = f"%{target_url.split('?')[0].rstrip('/')}%"
+                row = conn.execute(f"""
+                    SELECT url, title, company, site, application_url, tailored_resume_path,
+                           fit_score, location, full_description, cover_letter_path
+                    FROM jobs
+                    WHERE (application_url LIKE ? OR url LIKE ?)
+                      AND tailored_resume_path IS NOT NULL
+                      AND apply_status != 'in_progress'
+                      {status_clause}
+                    LIMIT 1
+                """, (like, like)).fetchone()
         else:
             blocked_sites, blocked_patterns = _load_blocked()
             # Build parameterized filters to avoid SQL injection
@@ -127,17 +190,31 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
             if blocked_patterns:
                 url_clauses = " ".join(f"AND url NOT LIKE ?" for _ in blocked_patterns)
                 params.extend(blocked_patterns)
+            # dry_run=True: the review queue -- unreviewed/previously-failed
+            # jobs, PLUS 'requested' ones (a human replied "yes" to that job
+            # number in the digest email -- see notify/digest.py's
+            # check_email_approvals). 'requested' jobs are prioritized first
+            # in ORDER BY so replying to the digest actually gets a job
+            # reviewed on the very next run, not whenever its raw fit_score
+            # would otherwise put it in the queue. dry_run=False: ONLY jobs
+            # a human has approved -- see the docstring above.
+            if dry_run:
+                status_clause = "(apply_status IS NULL OR apply_status = 'failed' OR apply_status = 'requested')"
+                order_clause = "(apply_status = 'requested') DESC, fit_score DESC, url"
+            else:
+                status_clause = "apply_status = 'approved'"
+                order_clause = "fit_score DESC, url"
             row = conn.execute(f"""
-                SELECT url, title, site, application_url, tailored_resume_path,
+                SELECT url, title, company, site, application_url, tailored_resume_path,
                        fit_score, location, full_description, cover_letter_path
                 FROM jobs
                 WHERE tailored_resume_path IS NOT NULL
-                  AND (apply_status IS NULL OR apply_status = 'failed')
+                  AND {status_clause}
                   AND (apply_attempts IS NULL OR apply_attempts < ?)
                   AND fit_score >= ?
                   {site_clause}
                   {url_clauses}
-                ORDER BY fit_score DESC, url
+                ORDER BY {order_clause}
                 LIMIT 1
             """, [config.DEFAULTS["max_apply_attempts"]] + params).fetchone()
 
@@ -174,8 +251,17 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
 
 def mark_result(url: str, status: str, error: str | None = None,
                 permanent: bool = False, duration_ms: int | None = None,
-                task_id: str | None = None) -> None:
-    """Update a job's apply status in the database."""
+                task_id: str | None = None, review_notes: str | None = None) -> None:
+    """Update a job's apply status in the database.
+
+    status='review_ready' is a DRY RUN outcome -- it must never set
+    applied_at or apply_status='applied' (that would falsely mark a job as
+    submitted when nothing was, and permanently remove it from every future
+    queue). It sets apply_status='pending_review' instead, storing the
+    agent's filled-form summary in review_notes for a human to read via
+    `applypilot apply --list-pending`, and doesn't touch apply_attempts --
+    review passes aren't a real attempt.
+    """
     conn = get_connection()
     now = datetime.now(timezone.utc).isoformat()
     if status == "applied":
@@ -185,6 +271,21 @@ def mark_result(url: str, status: str, error: str | None = None,
                            apply_duration_ms = ?, apply_task_id = ?
             WHERE url = ?
         """, (now, duration_ms, task_id, url))
+        conn.commit()
+        # Best-effort: mirror the submission into the user's manual tracker
+        # (Job search.xlsx). Never let this affect the apply pipeline itself.
+        try:
+            from applypilot.notify.tracker_sheet import log_application
+            log_application(url)
+        except Exception:
+            logger.exception("tracker_sheet logging failed for %s", url)
+    elif status == "review_ready":
+        conn.execute("""
+            UPDATE jobs SET apply_status = 'pending_review', apply_error = NULL,
+                           agent_id = NULL, apply_duration_ms = ?,
+                           apply_task_id = ?, review_notes = ?
+            WHERE url = ?
+        """, (duration_ms, task_id, review_notes, url))
     else:
         attempts = 99 if permanent else "COALESCE(apply_attempts, 0) + 1"
         conn.execute(f"""
@@ -207,6 +308,78 @@ def release_lock(url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Review / approval gate (human-in-the-loop before any real submission)
+# ---------------------------------------------------------------------------
+
+def list_pending_review() -> list[dict]:
+    """Jobs a dry-run pass has filled out and is waiting on a human to
+    review, ordered by fit_score. Read review_notes before approving."""
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT url, title, company, site, fit_score, review_notes, last_attempted_at
+        FROM jobs
+        WHERE apply_status = 'pending_review'
+        ORDER BY fit_score DESC, last_attempted_at DESC
+    """).fetchall()
+    if not rows:
+        return []
+    columns = rows[0].keys()
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def approve_job(url: str) -> bool:
+    """Approve one pending_review job for a real (live) submission.
+
+    Only jobs currently in 'pending_review' can be approved -- this can't
+    be used to bypass the review step for a job that was never dry-run
+    first.
+
+    Returns:
+        True if a matching pending_review job was approved, False otherwise.
+    """
+    conn = get_connection()
+    # Exact match first. Aggregator sites (Indeed, etc.) share one base path
+    # across every posting and only differ by a query param (e.g. ?jk=...),
+    # so a same-site LIKE fallback on the query-stripped base path can match
+    # every other pending_review job from that site too -- only fall back to
+    # that loose match (and only ever touch one row) if nothing exact is found.
+    cursor = conn.execute("""
+        UPDATE jobs SET apply_status = 'approved'
+        WHERE apply_status = 'pending_review' AND (url = ? OR application_url = ?)
+    """, (url, url))
+    if cursor.rowcount == 0:
+        like = f"%{url.split('?')[0].rstrip('/')}%"
+        row = conn.execute("""
+            SELECT url FROM jobs
+            WHERE apply_status = 'pending_review'
+              AND (application_url LIKE ? OR url LIKE ?)
+            LIMIT 1
+        """, (like, like)).fetchone()
+        if row is not None:
+            cursor = conn.execute(
+                "UPDATE jobs SET apply_status = 'approved' WHERE url = ? AND apply_status = 'pending_review'",
+                (row[0],),
+            )
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def approve_all_pending() -> int:
+    """Approve every job currently in pending_review. Use after reading
+    through `applypilot apply --list-pending`, not as a way to skip reading it.
+
+    Returns:
+        Number of jobs approved.
+    """
+    conn = get_connection()
+    cursor = conn.execute("""
+        UPDATE jobs SET apply_status = 'approved' WHERE apply_status = 'pending_review'
+    """)
+    conn.commit()
+    return cursor.rowcount
+
+
+# ---------------------------------------------------------------------------
 # Utility modes (--gen, --mark-applied, --mark-failed, --reset-failed)
 # ---------------------------------------------------------------------------
 
@@ -214,10 +387,15 @@ def gen_prompt(target_url: str, min_score: int = 7,
                model: str = "sonnet", worker_id: int = 0) -> Path | None:
     """Generate a prompt file and print the Claude CLI command for manual debugging.
 
+    Uses dry_run=True's queue matching (any tailored job, not just approved
+    ones) -- this never submits anything itself, it just writes a prompt
+    file and prints a command for a human to run by hand, so it isn't
+    subject to the approved-only restriction that gates real (live) runs.
+
     Returns:
         Path to the generated prompt file, or None if no job found.
     """
-    job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id)
+    job = acquire_job(target_url=target_url, min_score=min_score, worker_id=worker_id, dry_run=True)
     if not job:
         return None
 
@@ -275,6 +453,11 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
 def reset_failed() -> int:
     """Reset all failed jobs so they can be retried.
 
+    Deliberately excludes 'pending_review', 'approved', and 'requested' --
+    those hold real human review state (or a human's explicit go-ahead, via
+    CLI or an email reply) and must never be silently wiped by a
+    retry-the-failures sweep.
+
     Returns:
         Number of jobs reset.
     """
@@ -283,8 +466,8 @@ def reset_failed() -> int:
         UPDATE jobs SET apply_status = NULL, apply_error = NULL,
                        apply_attempts = 0, agent_id = NULL
         WHERE apply_status = 'failed'
-          OR (apply_status IS NOT NULL AND apply_status != 'applied'
-              AND apply_status != 'in_progress')
+          OR (apply_status IS NOT NULL AND apply_status NOT IN
+              ('applied', 'in_progress', 'pending_review', 'approved', 'requested'))
     """)
     conn.commit()
     return cursor.rowcount
@@ -295,13 +478,16 @@ def reset_failed() -> int:
 # ---------------------------------------------------------------------------
 
 def run_job(job: dict, port: int, worker_id: int = 0,
-            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int]:
+            model: str = "sonnet", dry_run: bool = False) -> tuple[str, int, str | None]:
     """Spawn a Claude Code session for one job application.
 
     Returns:
-        Tuple of (status_string, duration_ms). Status is one of:
-        'applied', 'expired', 'captcha', 'login_issue',
-        'failed:reason', or 'skipped'.
+        Tuple of (status_string, duration_ms, review_notes). review_notes is
+        only non-None when status is 'review_ready' (dry_run outcome) --
+        the agent's full response, including its written summary of every
+        field/answer it filled, for a human to read before ever approving a
+        real submission. Status is one of: 'applied', 'review_ready',
+        'expired', 'captcha', 'login_issue', 'failed:reason', or 'skipped'.
     """
     # Read tailored resume text
     resume_path = job.get("tailored_resume_path")
@@ -323,13 +509,21 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     # Build claude command
     cmd = [
-        "claude",
+        _resolve_claude_exe(),
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
         "--permission-mode", "bypassPermissions",
         "--no-session-persistence",
         "--disallowedTools", (
+            # send_email blocked deliberately: for an agent that reads untrusted
+            # job-posting text, the ability to send mail is a data-exfiltration
+            # path that outweighs its benefit. The email-only application
+            # fallback that used it has been removed from the prompt to match
+            # (see prompt.py step 4) -- a genuinely email-only posting now fails
+            # cleanly with RESULT:FAILED:email_only_application instead of
+            # reaching for a blocked tool.
+            "mcp__gmail__send_email,"
             "mcp__gmail__draft_email,mcp__gmail__modify_email,"
             "mcp__gmail__delete_email,mcp__gmail__download_attachment,"
             "mcp__gmail__batch_modify_emails,mcp__gmail__batch_delete_emails,"
@@ -349,16 +543,17 @@ def run_job(job: dict, port: int, worker_id: int = 0,
 
     worker_dir = reset_worker_dir(worker_id)
 
+    company_display = job.get("company") or job.get("site", "")
     update_state(worker_id, status="applying", job_title=job["title"],
-                 company=job.get("site", ""), score=job.get("fit_score", 0),
+                 company=company_display, score=job.get("fit_score", 0),
                  start_time=time.time(), actions=0, last_action="starting")
-    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {job.get('site', '')}")
+    add_event(f"[W{worker_id}] Starting: {job['title'][:40]} @ {company_display}")
 
     worker_log = config.LOG_DIR / f"worker-{worker_id}.log"
     ts_header = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log_header = (
         f"\n{'=' * 60}\n"
-        f"[{ts_header}] {job['title']} @ {job.get('site', '')}\n"
+        f"[{ts_header}] {job['title']} @ {company_display}\n"
         f"URL: {job.get('application_url') or job['url']}\n"
         f"Score: {job.get('fit_score', 'N/A')}/10\n"
         f"{'=' * 60}\n"
@@ -446,7 +641,7 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         proc = None
 
         if returncode and returncode < 0:
-            return "skipped", int((time.time() - start) * 1000)
+            return "skipped", int((time.time() - start) * 1000), None
 
         output = "\n".join(text_parts)
         elapsed = int(time.time() - start)
@@ -465,12 +660,22 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         def _clean_reason(s: str) -> str:
             return re.sub(r'[*`"]+$', '', s).strip()
 
+        if "RESULT:REVIEW_READY" in output:
+            add_event(f"[W{worker_id}] REVIEW_READY ({elapsed}s): {job['title'][:30]}")
+            update_state(worker_id, status="review_ready",
+                         last_action=f"REVIEW_READY ({elapsed}s)")
+            # The agent's full response (including its written summary of
+            # every field/answer it filled) is the review artifact -- a
+            # human reads this via `applypilot apply --list-pending` before
+            # ever approving a real submission.
+            return "review_ready", duration_ms, output
+
         for result_status in ["APPLIED", "EXPIRED", "CAPTCHA", "LOGIN_ISSUE"]:
             if f"RESULT:{result_status}" in output:
                 add_event(f"[W{worker_id}] {result_status} ({elapsed}s): {job['title'][:30]}")
                 update_state(worker_id, status=result_status.lower(),
                              last_action=f"{result_status} ({elapsed}s)")
-                return result_status.lower(), duration_ms
+                return result_status.lower(), duration_ms, None
 
         if "RESULT:FAILED" in output:
             for out_line in output.split("\n"):
@@ -486,28 +691,28 @@ def run_job(job: dict, port: int, worker_id: int = 0,
                         add_event(f"[W{worker_id}] {reason.upper()} ({elapsed}s): {job['title'][:30]}")
                         update_state(worker_id, status=reason,
                                      last_action=f"{reason.upper()} ({elapsed}s)")
-                        return reason, duration_ms
+                        return reason, duration_ms, None
                     add_event(f"[W{worker_id}] FAILED ({elapsed}s): {reason[:30]}")
                     update_state(worker_id, status="failed",
                                  last_action=f"FAILED: {reason[:25]}")
-                    return f"failed:{reason}", duration_ms
-            return "failed:unknown", duration_ms
+                    return f"failed:{reason}", duration_ms, None
+            return "failed:unknown", duration_ms, None
 
         add_event(f"[W{worker_id}] NO RESULT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"no result ({elapsed}s)")
-        return "failed:no_result_line", duration_ms
+        return "failed:no_result_line", duration_ms, None
 
     except subprocess.TimeoutExpired:
         duration_ms = int((time.time() - start) * 1000)
         elapsed = int(time.time() - start)
         add_event(f"[W{worker_id}] TIMEOUT ({elapsed}s)")
         update_state(worker_id, status="failed", last_action=f"TIMEOUT ({elapsed}s)")
-        return "failed:timeout", duration_ms
+        return "failed:timeout", duration_ms, None
     except Exception as e:
         duration_ms = int((time.time() - start) * 1000)
         add_event(f"[W{worker_id}] ERROR: {str(e)[:40]}")
         update_state(worker_id, status="failed", last_action=f"ERROR: {str(e)[:25]}")
-        return f"failed:{str(e)[:100]}", duration_ms
+        return f"failed:{str(e)[:100]}", duration_ms, None
     finally:
         with _claude_lock:
             _claude_procs.pop(worker_id, None)
@@ -524,7 +729,7 @@ PERMANENT_FAILURES: set[str] = {
     "not_eligible_location", "not_eligible_salary",
     "already_applied", "account_required",
     "not_a_job_application", "unsafe_permissions",
-    "unsafe_verification", "sso_required",
+    "unsafe_verification", "sso_required", "ats_login_required",
     "site_blocked", "cloudflare_blocked", "blocked_by_cloudflare",
 }
 
@@ -568,7 +773,10 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
     continuous = limit == 0
     jobs_done = 0
     empty_polls = 0
-    port = BASE_CDP_PORT + worker_id
+    # Verify the port is actually free. A foreign process already holding it
+    # would otherwise hand Playwright the wrong browser instead of failing
+    # outright (see chrome.py's BASE_CDP_PORT note).
+    port = find_free_cdp_port(BASE_CDP_PORT + worker_id)
 
     while not _stop_event.is_set():
         if not continuous and jobs_done >= limit:
@@ -578,7 +786,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
                      last_action="waiting for job", actions=0)
 
         job = acquire_job(target_url=target_url, min_score=min_score,
-                          worker_id=worker_id)
+                          worker_id=worker_id, dry_run=dry_run)
         if not job:
             if not continuous:
                 add_event(f"[W{worker_id}] Queue empty")
@@ -601,7 +809,7 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             add_event(f"[W{worker_id}] Launching Chrome...")
             chrome_proc = launch_chrome(worker_id, port=port, headless=headless)
 
-            result, duration_ms = run_job(job, port=port, worker_id=worker_id,
+            result, duration_ms, review_notes = run_job(job, port=port, worker_id=worker_id,
                                             model=model, dry_run=dry_run)
 
             if result == "skipped":
@@ -611,6 +819,16 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             elif result == "applied":
                 mark_result(job["url"], "applied", duration_ms=duration_ms)
                 applied += 1
+                update_state(worker_id, jobs_applied=applied,
+                             jobs_done=applied + failed)
+            elif result == "review_ready":
+                # Dry-run outcome -- NOT applied. Sits in pending_review
+                # until a human reads the notes and explicitly approves it
+                # (`applypilot apply --approve <url>`) before any real,
+                # submitting run can ever pick it up.
+                mark_result(job["url"], "review_ready", duration_ms=duration_ms,
+                            review_notes=review_notes)
+                applied += 1  # counts toward this run's "done" total for the dashboard
                 update_state(worker_id, jobs_applied=applied,
                              jobs_done=applied + failed)
             else:
@@ -635,7 +853,24 @@ def worker_loop(worker_id: int = 0, limit: int = 1,
             failed += 1
             update_state(worker_id, jobs_failed=failed)
         finally:
-            if chrome_proc:
+            # A CAPTCHA is the one failure a human can finish in seconds --
+            # but only if the browser is still on the filled-in form. Closing
+            # it here threw that away: every field was completed, then the
+            # window vanished before anyone could tick the box. So on a
+            # visible (non-headless) run, leave Chrome open and hand it over.
+            hand_over = (
+                not headless
+                and isinstance(locals().get("result"), str)
+                and locals().get("result", "").startswith("captcha")
+            )
+            if hand_over:
+                chrome.keep_browser_open()  # also stops the atexit sweep
+                add_event(f"[W{worker_id}] CAPTCHA -- browser left open for you")
+                logger.warning(
+                    "Form is filled and waiting on the CAPTCHA. The Chrome window has "
+                    "been left open -- tick the checkbox, press Submit, then close it."
+                )
+            elif chrome_proc:
                 cleanup_worker(worker_id, chrome_proc)
 
         jobs_done += 1
@@ -670,6 +905,8 @@ def main(limit: int = 1, target_url: str | None = None,
     global POLL_INTERVAL
     POLL_INTERVAL = poll_interval
     _stop_event.clear()
+
+    run_start = datetime.now(timezone.utc).isoformat()
 
     config.ensure_dirs()
     console = Console()
@@ -792,3 +1029,44 @@ def main(limit: int = 1, target_url: str | None = None,
     finally:
         _stop_event.set()
         kill_all_chrome()
+        _notify_run_results(run_start, console)
+
+
+def _notify_run_results(run_start: str, console: Console) -> None:
+    """Email a summary of anything from this run that needs human attention:
+    CAPTCHA blocks (go solve these yourself), jobs ready for review (from a
+    --dry-run pass), and real applies. Scoped to this run via
+    last_attempted_at, which acquire_job() stamps when a job is claimed.
+    Best-effort -- a notification failure should never crash the run that
+    already completed."""
+    try:
+        conn = get_connection()
+
+        def _fetch(status: str, extra_cols: str = "") -> list[dict]:
+            rows = conn.execute(f"""
+                SELECT url, title, company, site, fit_score, application_url {extra_cols}
+                FROM jobs WHERE apply_status = ? AND last_attempted_at >= ?
+            """, (status, run_start)).fetchall()
+            if not rows:
+                return []
+            columns = rows[0].keys()
+            return [dict(zip(columns, row)) for row in rows]
+
+        captcha_jobs = _fetch("captcha")
+        reviewed_jobs = _fetch("pending_review", ", review_notes")
+        applied_jobs = _fetch("applied")
+
+        if not (captcha_jobs or reviewed_jobs or applied_jobs):
+            return
+
+        from applypilot.notify.digest import send_apply_run_notification
+        result = send_apply_run_notification(captcha_jobs, reviewed_jobs, applied_jobs)
+        if result.get("sent"):
+            console.print(
+                f"[dim]Notified by email: {len(captcha_jobs)} captcha, "
+                f"{len(reviewed_jobs)} for review, {len(applied_jobs)} applied.[/dim]"
+            )
+        elif result.get("error"):
+            console.print(f"[yellow]Could not send apply notification email: {result['error']}[/yellow]")
+    except Exception:
+        logger.exception("Failed to send apply run notification email")

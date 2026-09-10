@@ -40,6 +40,23 @@ BANNED_WORDS: list[str] = [
     "furthermore", "additionally", "moreover",
 ]
 
+# Phrases that are ALWAYS an error, regardless of validation_mode (unlike
+# BANNED_WORDS, which is only a warning in "normal" mode). Two categories:
+# style bans ("seasoned") and language-proficiency overstatements -- a
+# generated document must never claim a higher level than profile.json's
+# `languages` states. The concrete phrases below are the ones that have shown
+# up in practice for a candidate who is not fluent/native in German or French;
+# extend the list for your own profile.
+HARD_BANNED_PHRASES: list[str] = [
+    "seasoned", "seasoned professional",
+    "fluent german", "fluent in german", "native german", "german native",
+    "c1 german", "german c1", "advanced german", "german (fluent",
+    "fluent french", "fluent in french", "native french", "french native",
+    "advanced french", "french (fluent",
+    # Cover-letter filler the candidate never wants to see again
+    "make that case concretely", "want to make that case",
+]
+
 LLM_LEAK_PHRASES: list[str] = [
     "i am sorry", "i apologize", "i will try", "let me try",
     "i am at a loss", "i am truly sorry", "apologies for",
@@ -85,6 +102,21 @@ def _build_skills_set(profile: dict) -> set[str]:
     return allowed
 
 
+def _check_hard_banned(text_lower: str) -> list[str]:
+    """Phrases that are always an error -- checked identically in every
+    validate_* function, independent of validation_mode."""
+    return [p for p in HARD_BANNED_PHRASES if p in text_lower]
+
+
+def company_variants(entry) -> list[str]:
+    """A preserved_companies entry is either a plain company name (str) or a
+    list of acceptable name variants for the same company (e.g.
+    ["Acme Corp", "Acme", "Acme Inc"]) when the original resume refers to it
+    inconsistently or by an abbreviation. Always returns a flat list of
+    strings, so callers never need to check which shape they got."""
+    return list(entry) if isinstance(entry, list) else [entry]
+
+
 def sanitize_text(text: str) -> str:
     """Auto-fix common LLM output issues instead of rejecting."""
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")   # em dash -> comma
@@ -94,13 +126,29 @@ def sanitize_text(text: str) -> str:
     return text.strip()
 
 
+def sanitize_cover_letter_text(text: str) -> str:
+    """Same smart-quote normalization as sanitize_text, but keeps em/en dashes --
+    the cover letter house style (see the reference examples) uses them
+    deliberately for asides, unlike the resume's comma-only style."""
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    return text.strip()
+
+
 # ── JSON Field Validation ─────────────────────────────────────────────────
 
 def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dict:
     """Validate individual JSON fields from an LLM-generated tailored resume.
 
     Args:
-        data:    Parsed JSON from the LLM (title, summary, skills, experience, projects, education).
+        data:    Parsed JSON from the LLM (summary, experience, skills).
+                 Experience entries have `header`, `company_line`,
+                 `job_scope` (bullets), and `achievements` (bullets).
+                 Header/company_line are code-enforced verbatim upstream
+                 (see tailor.py::_enforce_verbatim_facts) before this runs.
+                 Education, Projects, Software Skills, Languages, and
+                 Certifications are rendered verbatim from resume.txt and
+                 never reach this function at all.
         profile: User profile dict from load_profile().
         mode:    Validation strictness — "strict", "normal", or "lenient".
                  strict  → banned words are errors (trigger retries)
@@ -114,23 +162,15 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     warnings: list[str] = []
 
     # Required keys — always checked regardless of mode
-    for key in ("title", "summary", "skills", "experience", "projects", "education"):
+    for key in ("summary", "experience"):
         if key not in data or not data[key]:
             errors.append(f"Missing required field: {key}")
     if errors:
         return {"passed": False, "errors": errors, "warnings": warnings}
 
     # Collect all text for bulk checks
-    all_text_parts: list[str] = [data["summary"]]
-
-    # Skills: check for fabrication (always enforced)
-    if isinstance(data["skills"], dict):
-        skills_text = " ".join(str(v) for v in data["skills"].values()).lower()
-        for fake in FABRICATION_WATCHLIST:
-            if len(fake) <= 2:
-                continue
-            if fake in skills_text:
-                errors.append(f"Fabricated skill: '{fake}'")
+    all_text_parts: list[str] = [str(data["summary"])]
+    malformed_bullets = 0
 
     # Experience: preserved companies must be present (always enforced)
     resume_facts = profile.get("resume_facts", {})
@@ -138,28 +178,33 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
 
     if isinstance(data["experience"], list):
         for company in preserved_companies:
+            variants = company_variants(company)
+            # Search the whole entry (header + company_line + both bullet
+            # groups), not just the header -- a merger/acquisition mention can
+            # legitimately live in a bullet while the header/company_line stay
+            # verbatim.
             has_company = any(
-                company.lower() in str(e.get("header", "")).lower()
+                v.lower() in (
+                    str(e.get("header", "")) + " " + str(e.get("company_line", "")) + " " +
+                    " ".join(str(b) for b in e.get("job_scope", [])) + " " +
+                    " ".join(str(b) for b in e.get("achievements", []))
+                ).lower()
                 for e in data["experience"]
+                for v in variants
             )
             if not has_company:
-                errors.append(f"Company '{company}' missing from experience")
+                errors.append(f"Company '{variants[0]}' missing from experience")
         for entry in data["experience"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
+            for b in entry.get("job_scope", []) + entry.get("achievements", []):
+                if not isinstance(b, str):
+                    malformed_bullets += 1
+                all_text_parts.append(str(b))
 
-    # Projects: collect bullets
-    if isinstance(data["projects"], list):
-        for entry in data["projects"]:
-            for b in entry.get("bullets", []):
-                all_text_parts.append(b)
-
-    # Education: preserved school must be present (always enforced)
-    preserved_school = resume_facts.get("preserved_school", "")
-    if preserved_school:
-        edu = str(data.get("education", ""))
-        if preserved_school.lower() not in edu.lower():
-            errors.append(f"Education '{preserved_school}' missing")
+    if malformed_bullets:
+        errors.append(
+            f"{malformed_bullets} bullet(s) were not plain strings (nested list/dict) -- "
+            "each bullet must be a single string"
+        )
 
     # Bulk text checks
     all_text = " ".join(all_text_parts).lower()
@@ -168,6 +213,11 @@ def validate_json_fields(data: dict, profile: dict, mode: str = "normal") -> dic
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in all_text]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
+
+    # Hard bans (style + language-proficiency overstatement) -- always an error
+    found_hard_banned = _check_hard_banned(all_text)
+    if found_hard_banned:
+        errors.append(f"Hard-banned phrase: '{found_hard_banned[0]}'")
 
     # Banned filler words — severity depends on mode
     if mode != "lenient":
@@ -221,8 +271,9 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 
     # 3. Check companies preserved
     for company in resume_facts.get("preserved_companies", []):
-        if company.lower() not in text_lower:
-            errors.append(f"Company '{company}' missing -- cannot remove real experience")
+        variants = company_variants(company)
+        if not any(v.lower() in text_lower for v in variants):
+            errors.append(f"Company '{variants[0]}' missing -- cannot remove real experience")
 
     # 4. Check projects preserved
     for project in resume_facts.get("preserved_projects", []):
@@ -276,6 +327,11 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
 
+    # 11b. Hard bans (style + language-proficiency overstatement) -- always an error
+    found_hard_banned = _check_hard_banned(text_lower)
+    if found_hard_banned:
+        errors.append(f"Hard-banned phrase: '{found_hard_banned[0]}'")
+
     # 12. Duplicate section detection
     for section_name in ["summary", "experience", "education", "projects"]:
         count = text_lower.count(f"\n{section_name}\n") + text_lower.count(f"\n{section_name} \n")
@@ -294,14 +350,17 @@ def validate_tailored_resume(text: str, profile: dict, original_text: str = "") 
 # ── Cover Letter Validation ──────────────────────────────────────────────
 
 def validate_cover_letter(text: str, mode: str = "normal") -> dict:
-    """Programmatic validation of a cover letter.
+    """Programmatic validation of a cover letter BODY (opening paragraph
+    through the closing line only -- the salutation, subject line, and
+    sign-off are code-injected separately in assemble_cover_letter_text and
+    never reach this function).
 
     Args:
-        text: The cover letter text to validate.
-        mode: Validation strictness — "strict", "normal", or "lenient".
-              strict  → banned words are errors (trigger retries); word limit enforced
-              normal  → banned words are warnings; word limit is soft (+25 words)
-              lenient → banned words ignored; word count not checked
+        text: The cover letter body text to validate.
+        mode: Validation strictness -- "strict", "normal", or "lenient".
+              strict  -> banned words are errors (trigger retries); word limit enforced
+              normal  -> banned words are warnings; word limit is soft
+              lenient -> banned words ignored; word count not checked
 
     Returns:
         {"passed": bool, "errors": list[str], "warnings": list[str]}
@@ -310,13 +369,9 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
     warnings: list[str] = []
     text_lower = text.lower()
 
-    # 1. Em dashes — always an error (sanitize_text should have caught these)
-    if "\u2014" in text or "\u2013" in text:
-        errors.append("Contains em dash or en dash.")
-
-    # 2. Banned words — severity depends on mode
+    # 1. Banned words -- severity depends on mode
     if mode != "lenient":
-        found = [w for w in BANNED_WORDS if re.search(r"\b" + re.escape(w) + r"\b", text_lower)]
+        found = [w for w in BANNED_WORDS if re.search(r"" + re.escape(w) + r"", text_lower)]
         if found:
             msg = f"Banned words: {', '.join(found[:5])}"
             if mode == "strict":
@@ -324,22 +379,32 @@ def validate_cover_letter(text: str, mode: str = "normal") -> dict:
             else:  # normal
                 warnings.append(msg)
 
-    # 3. Word count
+    # 2. Word count -- this house style is a detailed, multi-paragraph letter
+    # (see the reference examples, roughly 450-700 words), not a terse pitch.
     words = len(text.split())
-    if mode == "strict" and words > 250:
-        errors.append(f"Too long ({words} words). Max 250.")
-    elif mode == "normal" and words > 275:
-        warnings.append(f"Long ({words} words). Target 250.")
+    if mode == "strict" and words > 850:
+        errors.append(f"Too long ({words} words). Max 850.")
+    elif mode == "normal" and words > 900:
+        warnings.append(f"Long ({words} words). Target 450-700.")
+    if words < 300:
+        warnings.append(f"Short ({words} words) for this house style. Target 450-700.")
     # lenient: no word count check
 
-    # 4. LLM self-talk — always an error regardless of mode
+    # 3. LLM self-talk -- always an error regardless of mode
     found_leaks = [p for p in LLM_LEAK_PHRASES if p in text_lower]
     if found_leaks:
         errors.append(f"LLM self-talk: '{found_leaks[0]}'")
 
-    # 5. Must start with "Dear" — always checked (preamble should have been stripped)
+    # 3b. Hard bans (style + language-proficiency overstatement) -- always an error
+    found_hard_banned = _check_hard_banned(text_lower)
+    if found_hard_banned:
+        errors.append(f"Hard-banned phrase: '{found_hard_banned[0]}'")
+
+    # 4. Must NOT include its own salutation/sign-off -- those are code-injected
     stripped = text.strip()
-    if not stripped.lower().startswith("dear"):
-        errors.append("Must start with 'Dear Hiring Manager,'")
+    if stripped.lower().startswith("dear "):
+        errors.append("Body must not start with 'Dear ...' -- the salutation is added separately.")
+    if "kind regards" in text_lower or "best regards" in text_lower:
+        errors.append("Body must not include a sign-off -- 'Kind regards' is added separately.")
 
     return {"passed": len(errors) == 0, "errors": errors, "warnings": warnings}
