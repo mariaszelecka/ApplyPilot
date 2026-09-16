@@ -48,6 +48,35 @@ def is_senior_title(title: str | None) -> bool:
     return bool(_SENIOR_PATTERN.search(title))
 
 
+# ── Graduate/university-entry scheme filter (deterministic) ─────────────
+# The opposite problem from seniority: these programs are explicitly scoped
+# to recent graduates / early-career hires (often with an eligibility window
+# of 0-2 years post-degree), so a 6-year-experienced, dual-Masters candidate
+# is overqualified for them, not a fit. They score well on the LLM path
+# because the company is a priority employer and the industry matches --
+# nothing about "graduate scheme" trips the seniority or coding dealbreakers,
+# so without an explicit check they kept reaching the digest (UBS "Graduate
+# Talent Program" / Julius Baer "University Graduate" postings, repeatedly).
+# Phrase-based, not a bare "graduate" match -- that word alone appears in
+# unrelated contexts ("graduate degree preferred") that must NOT be excluded.
+_GRADUATE_PROGRAM_KEYWORDS = (
+    "graduate talent program", "graduate talent programme",
+    "graduate program", "graduate programme", "graduate scheme",
+    "graduate trainee", "university graduate", "new graduate",
+    "campus hire", "campus graduate",
+)
+_GRADUATE_PROGRAM_PATTERN = re.compile(
+    r"\b(?:" + "|".join(re.escape(k) for k in _GRADUATE_PROGRAM_KEYWORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_graduate_program_title(title: str | None) -> bool:
+    if not title:
+        return False
+    return bool(_GRADUATE_PROGRAM_PATTERN.search(title))
+
+
 # ── Scoring Prompt ────────────────────────────────────────────────────────
 
 SCORE_PROMPT = """You are a job fit evaluator. Given a candidate's resume, their job preferences, and a job description, score how well the candidate fits the role.
@@ -361,6 +390,9 @@ def score_job(resume_text: str, job: dict) -> dict:
     # backlog discovered before that filter existed.
     if is_senior_title(job.get("title")):
         return {"score": 1, "keywords": "", "reasoning": "Excluded: senior/lead/director-level title, candidate is targeting entry-level roles"}
+
+    if is_graduate_program_title(job.get("title")):
+        return {"score": 1, "keywords": "", "reasoning": "Excluded: university graduate / graduate talent program -- candidate has 6 years' experience and two Master's degrees, overqualified for an early-career entry scheme"}
 
     if is_consulting_manager_title(job.get("title"), job.get("company")):
         return {"score": 1, "keywords": "", "reasoning": f"Excluded: 'Manager' title at {job.get('company')} denotes a senior, experienced-hire grade at major consulting firms, candidate is targeting entry-level roles"}

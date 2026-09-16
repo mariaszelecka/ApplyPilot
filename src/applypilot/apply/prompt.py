@@ -455,6 +455,15 @@ def build_prompt(job: dict, tailored_resume: str,
     search_config = config.load_search_config()
     personal = profile["personal"]
 
+    # Defensive backstop: application_url can be the literal string "null"
+    # (an LLM-extraction quirk -- see enrichment/detail.py) rather than a real
+    # None, which is truthy and would otherwise survive the `or job['url']`
+    # fallback below and get shown to the agent as a real link. Fixed at the
+    # source too, but this is the one place that actually reaches the agent,
+    # so it stays guarded here regardless of what fixes the write side.
+    if job.get("application_url") and str(job["application_url"]).strip().lower() in ("null", "none", "nan", ""):
+        job = {**job, "application_url": None}
+
     # --- Resolve resume PDF path ---
     resume_path = job.get("tailored_resume_path")
     if not resume_path:

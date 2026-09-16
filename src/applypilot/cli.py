@@ -200,6 +200,19 @@ def daily(
 
     check_tier(2, "AI scoring/tailoring")
 
+    # Catch up on any tracker-sheet rows queued from a past run where the
+    # spreadsheet was open in Excel at the moment an application succeeded --
+    # this is the only opportunity to flush them on a day with no new
+    # application of its own.
+    try:
+        from applypilot.notify.tracker_sheet import flush_pending
+        flushed = flush_pending()
+        if flushed:
+            console.print(f"[dim]Tracker sheet: caught up on {flushed} queued row(s).[/dim]")
+    except Exception as e:
+        log.exception("Tracker sheet flush failed")
+        console.print(f"[yellow]Tracker sheet flush failed: {e}[/yellow]")
+
     try:
         from applypilot.notify.digest import check_email_approvals
         approval_result = check_email_approvals()

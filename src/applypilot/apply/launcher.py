@@ -441,6 +441,12 @@ def mark_job(url: str, status: str, reason: str | None = None) -> None:
                            apply_error = NULL, agent_id = NULL
             WHERE url = ?
         """, (now, url))
+        conn.commit()
+        try:
+            from applypilot.notify.tracker_sheet import log_application
+            log_application(url)
+        except Exception:
+            logger.exception("tracker_sheet logging failed for %s", url)
     else:
         conn.execute("""
             UPDATE jobs SET apply_status = 'failed', apply_error = ?,
@@ -513,6 +519,19 @@ def run_job(job: dict, port: int, worker_id: int = 0,
         "--model", model,
         "-p",
         "--mcp-config", str(mcp_config_path),
+        # Without this, Claude Code also loads whatever OTHER MCP servers are
+        # configured at the user/project level (Notion, Calendar, Drive,
+        # Composio, ...) alongside the two this worker actually needs. Root
+        # cause of a real failure (2026-09-15): a job failed with
+        # "no browser tooling" because those unrelated servers loaded and
+        # crowded out/masked playwright, not because of the MCP-startup race
+        # this prompt already retries for. It's also a scope leak in its own
+        # right -- an unattended agent reading untrusted job-posting text has
+        # no business being able to reach Notion/Calendar/Drive/Gmail-beyond-
+        # what's explicitly allowed. This restricts it to exactly the two
+        # servers in _make_mcp_config: playwright and gmail (itself already
+        # narrowed by --disallowedTools above).
+        "--strict-mcp-config",
         "--permission-mode", "bypassPermissions",
         "--no-session-persistence",
         "--disallowedTools", (

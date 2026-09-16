@@ -497,6 +497,14 @@ def extract_with_llm(page, url: str) -> dict:
         result = extract_json(raw)
         desc = result.get("full_description")
         apply_url = result.get("application_url")
+        # The model is told to return JSON `null` (-> Python None) when there's
+        # no URL, but sometimes writes the literal string "null" instead --
+        # that string is truthy, so it survives every `or job['url']` fallback
+        # downstream and gets shown to the apply agent as if it were a real
+        # link. Same failure shape as the JobSpy-side "None"-string bug fixed
+        # earlier; this is the LLM-extraction-side equivalent.
+        if apply_url and str(apply_url).strip().lower() in ("null", "none", "nan", ""):
+            apply_url = None
 
         if desc:
             desc = clean_description(desc)

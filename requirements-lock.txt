@@ -1,0 +1,37 @@
+# Exact dependency versions verified working on the current running setup.
+#
+# pyproject.toml declares open-ended floors (>=) so the tool stays installable
+# as the ecosystem moves forward. This file is the other half: a snapshot of
+# versions that are actually proven to work together right now, for anyone who
+# wants a reproducible install instead of "whatever pip resolves today".
+#
+# Usage:
+#   pip install -e .
+#   pip install -r requirements-lock.txt
+#
+# Regenerate after deliberately upgrading something:
+#   pip freeze | grep -f <(sed 's/[><=].*//' requirements-lock.txt) > requirements-lock.txt
+
+typer==0.26.8
+rich==15.0.0
+httpx==0.28.1
+beautifulsoup4==4.15.0
+playwright==1.60.0
+python-dotenv==1.2.2
+pyyaml==6.0.3
+pandas==3.0.4
+
+# Discovery scraper and its notoriously finicky numpy pin (see README for the
+# --no-deps install workaround this version requires).
+python-jobspy==1.1.82
+numpy==2.5.0
+
+# Used by scoring/pdf.py and notify/tracker_sheet.py
+openpyxl==3.1.5
+requests==2.34.1
+
+# Dev/lint (optional extra) -- not installed in the environment this lockfile
+# was generated from, so left unpinned here. Run `pip install -e ".[dev]"`,
+# then `pip freeze | grep -Ei "^(pytest|ruff)=="` and add the real versions.
+# pytest==
+# ruff==

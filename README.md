@@ -2,6 +2,8 @@
 
 > **⚠️ ApplyPilot** is the original open-source project, created by [Pickle-Pixel](https://github.com/Pickle-Pixel) and first published on GitHub on **February 17, 2026**. We are **not affiliated** with applypilot.app, useapplypilot.com, or any other product using the "ApplyPilot" name. These sites are **not associated with this project** and may misrepresent what they offer. If you're looking for the autonomous, open-source job application agent — you're in the right place.
 
+> **This fork** ([mariaszelecka/ApplyPilot](https://github.com/mariaszelecka/ApplyPilot)) is maintained independently from the original, with substantial changes: an explicit approval gate (nothing is tailored or submitted without an email reply naming the job), region-based match filtering, a single-email digest-and-approve flow, and a round of reliability and security hardening. See commit history for the full set of changes.
+
 # ApplyPilot
 
 **Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**

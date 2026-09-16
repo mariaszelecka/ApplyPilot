@@ -9,10 +9,19 @@ A=Date B=Firm C=Role D=Link E=Location F=source-tag.
 Best-effort and must never break the apply pipeline: any failure here is
 logged and swallowed, never raised, and the sheet is written defensively --
 see _is_file_locked below for why.
+
+RETRY QUEUE: a file open in Excel at the moment of a successful application
+is a normal, frequent situation (confirmed happening in practice -- an
+application succeeded while the sheet was open and the row was silently
+skipped with only a log line to show for it). Rather than lose that row
+permanently, it's queued to a small local JSON file and retried on every
+future call to log_application() -- so the next application (or a periodic
+flush_pending()) catches up on it once the sheet is closed again.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -26,9 +35,14 @@ def _tracker_path() -> Path | None:
     return Path(raw) if raw else None
 
 
+def _queue_path() -> Path:
+    from applypilot.config import APP_DIR
+    return APP_DIR / "tracker_pending.json"
+
+
 # Matched case-insensitively against a target month's full name or 3-letter
 # abbreviation -- never auto-created, since guessing at a new month's
-# formatting/layout risks doing it wrong. See log_application().
+# formatting/layout risks doing it wrong. See _write_row().
 _MONTH_NAMES = {
     1: "January", 2: "February", 3: "March", 4: "April", 5: "May", 6: "June",
     7: "July", 8: "August", 9: "September", 10: "October", 11: "November",
@@ -70,80 +84,152 @@ def _next_row(ws, cols: str = "ABCDEF") -> int:
     return row
 
 
+def _load_queue() -> list[str]:
+    path = _queue_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return list(data) if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_queue(urls: list[str]) -> None:
+    try:
+        _queue_path().write_text(json.dumps(urls, indent=2), encoding="utf-8")
+    except OSError as e:
+        log.warning("tracker_sheet: could not persist pending queue: %s", e)
+
+
+def _write_row(tracker_path: Path, url: str) -> bool:
+    """Attempt to write one row. Returns True on success, False on any
+    skip/failure (locked file, missing tab, missing DB row, etc.)."""
+    from applypilot.database import get_connection
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT title, company, location, url, application_url "
+        "FROM jobs WHERE url = ?",
+        (url,),
+    ).fetchone()
+    if not row:
+        log.warning("tracker_sheet: no DB row for %s -- dropping from queue.", url)
+        return True  # nothing to retry -- treat as "handled" so it's not requeued forever
+    job = dict(row)
+
+    if not tracker_path.exists():
+        log.warning("tracker_sheet: %s not found -- skipping.", tracker_path)
+        return False
+
+    if _is_file_locked(tracker_path):
+        return False
+
+    import openpyxl
+    now = datetime.now(timezone.utc)
+    wb = openpyxl.load_workbook(tracker_path)
+    sheet_name = _sheet_for_month(wb.sheetnames, now)
+    if not sheet_name:
+        log.warning(
+            "tracker_sheet: no tab found for %s among %s -- skipping "
+            "rather than guessing a new tab's layout.",
+            _MONTH_NAMES[now.month], wb.sheetnames,
+        )
+        return True  # not a locked-file case -- retrying won't help, don't requeue
+
+    ws = wb[sheet_name]
+    r = _next_row(ws)
+    link = job.get("application_url") or job.get("url")
+    title = (job.get("title") or "").strip()
+
+    ws[f"A{r}"] = now.strftime("%d.%m.%Y")
+    ws[f"B{r}"] = job.get("company") or ""
+    title_cell = ws[f"C{r}"]
+    title_cell.value = title
+    if link:
+        title_cell.hyperlink = link
+    ws[f"D{r}"] = link or ""
+    if job.get("location"):
+        ws[f"E{r}"] = job["location"]
+    tag_cell = ws[f"F{r}"]
+    tag_cell.value = _SOURCE_TAG
+    tag_cell.font = tag_cell.font.copy(bold=True)
+
+    wb.save(tracker_path)
+    log.info("tracker_sheet: logged '%s' @ '%s' to %s (row %d)",
+             title, job.get("company"), sheet_name, r)
+    return True
+
+
+def flush_pending() -> int:
+    """Retry every queued row (from past locked-file skips). Call this
+    opportunistically -- at the start of a daily/poll run is a good spot --
+    so a row queued while the sheet was open gets written once it's closed,
+    even on a day with no new application to trigger it.
+
+    Returns:
+        Number of rows successfully written.
+    """
+    tracker_path = _tracker_path()
+    queue = _load_queue()
+    if tracker_path is None or not queue:
+        return 0
+
+    written = 0
+    still_pending: list[str] = []
+    for url in queue:
+        try:
+            ok = _write_row(tracker_path, url)
+        except Exception as e:
+            log.warning("tracker_sheet: retry failed for %s: %s", url, e)
+            ok = False
+        if ok:
+            written += 1
+        else:
+            still_pending.append(url)
+
+    _save_queue(still_pending)
+    if written:
+        log.info("tracker_sheet: flushed %d pending row(s), %d still waiting.",
+                 written, len(still_pending))
+    return written
+
+
 def log_application(url: str) -> bool:
     """Append one row for a job that was just successfully submitted.
+
+    Also opportunistically flushes any previously-queued rows first, so a
+    later successful application helps clear a backlog from an earlier one
+    that hit a locked file.
 
     Args:
         url: The job's canonical URL (jobs.url), used to look up its details.
 
     Returns:
-        True if a row was written, False if it was skipped (file locked,
-        month tab not found, file missing, or any other failure) -- callers
-        should treat False as "best-effort, no row added" and move on.
+        True if this job's row was written (now or already queued -- either
+        way it will land eventually). False only if the feature isn't
+        configured or the DB has no record of this URL.
     """
     tracker_path = _tracker_path()
     if tracker_path is None:
         return False  # feature not configured -- silent no-op
 
     try:
-        from applypilot.database import get_connection
-        conn = get_connection()
-        row = conn.execute(
-            "SELECT title, company, location, url, application_url "
-            "FROM jobs WHERE url = ?",
-            (url,),
-        ).fetchone()
-        if not row:
-            log.warning("tracker_sheet: no DB row for %s -- skipping.", url)
-            return False
-        job = dict(row)
+        flush_pending()
 
-        if not tracker_path.exists():
-            log.warning("tracker_sheet: %s not found -- skipping.", tracker_path)
-            return False
+        ok = _write_row(tracker_path, url)
+        if ok:
+            return True
 
-        if _is_file_locked(tracker_path):
+        # Locked (or some other transient issue) -- queue it rather than lose it.
+        queue = _load_queue()
+        if url not in queue:
+            queue.append(url)
+            _save_queue(queue)
             log.warning(
-                "tracker_sheet: %s is open in Excel -- skipping to avoid a "
-                "write that could be silently lost on next Save. Add this "
-                "one manually: %s @ %s",
-                tracker_path.name, job.get("title"), job.get("company"),
+                "tracker_sheet: %s is open (or otherwise unwritable) -- queued "
+                "for %s, will retry on the next application or flush.",
+                tracker_path.name, url,
             )
-            return False
-
-        import openpyxl
-        now = datetime.now(timezone.utc)
-        wb = openpyxl.load_workbook(tracker_path)
-        sheet_name = _sheet_for_month(wb.sheetnames, now)
-        if not sheet_name:
-            log.warning(
-                "tracker_sheet: no tab found for %s among %s -- skipping "
-                "rather than guessing a new tab's layout.",
-                _MONTH_NAMES[now.month], wb.sheetnames,
-            )
-            return False
-        ws = wb[sheet_name]
-
-        r = _next_row(ws)
-        link = job.get("application_url") or job.get("url")
-        title = (job.get("title") or "").strip()
-
-        ws[f"A{r}"] = now.strftime("%d.%m.%Y")
-        ws[f"B{r}"] = job.get("company") or ""
-        title_cell = ws[f"C{r}"]
-        title_cell.value = title
-        if link:
-            title_cell.hyperlink = link
-        ws[f"D{r}"] = link or ""
-        if job.get("location"):
-            ws[f"E{r}"] = job["location"]
-        tag_cell = ws[f"F{r}"]
-        tag_cell.value = _SOURCE_TAG
-        tag_cell.font = tag_cell.font.copy(bold=True)
-
-        wb.save(tracker_path)
-        log.info("tracker_sheet: logged '%s' @ '%s' to %s!%s (row %d)",
-                 title, job.get("company"), sheet_name, "!", r)
         return True
 
     except Exception as e:

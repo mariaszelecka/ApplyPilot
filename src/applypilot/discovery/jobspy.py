@@ -18,7 +18,11 @@ from jobspy import scrape_jobs
 from applypilot import config
 from applypilot.database import get_connection, init_db, store_jobs
 from applypilot.discovery.freshness import looks_expired
-from applypilot.scoring.scorer import is_consulting_manager_title, is_senior_title
+from applypilot.scoring.scorer import (
+    is_consulting_manager_title,
+    is_graduate_program_title,
+    is_senior_title,
+)
 
 log = logging.getLogger(__name__)
 
@@ -372,9 +376,11 @@ def _run_one_search(
     ), axis=1)]
     filtered = before - len(df)
 
-    # Entry-level prefilter: drop senior/lead/director-level LinkedIn postings,
-    # plus "Manager"-titled postings at major consulting firms (a senior,
-    # experienced-hire grade there specifically -- see scorer.py).
+    # Seniority/scheme prefilter: drop senior/lead/director-level LinkedIn
+    # postings, "Manager"-titled postings at major consulting firms (a senior,
+    # experienced-hire grade there specifically), and university-graduate /
+    # graduate-talent-program postings (overqualified in the other direction
+    # -- see scorer.py for all three).
     before_senior = len(df)
     if "site" in df.columns:
         df = df[~df.apply(
@@ -382,6 +388,7 @@ def _run_one_search(
             and (
                 is_senior_title(str(row.get("title", "")))
                 or is_consulting_manager_title(str(row.get("title", "")), str(row.get("company", "")))
+                or is_graduate_program_title(str(row.get("title", "")))
             ),
             axis=1,
         )]
