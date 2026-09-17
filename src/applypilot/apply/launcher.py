@@ -202,7 +202,15 @@ def acquire_job(target_url: str | None = None, min_score: int = 7,
                 status_clause = "(apply_status IS NULL OR apply_status = 'failed' OR apply_status = 'requested')"
                 order_clause = "(apply_status = 'requested') DESC, fit_score DESC, url"
             else:
-                status_clause = "apply_status = 'approved'"
+                # A live run also re-picks up a job that already went through
+                # approval and then failed -- e.g. an MCP-startup timing race,
+                # not something that needs a human. This does NOT reopen jobs
+                # that need a human: mark_result() jumps apply_attempts straight
+                # to 99 for a PERMANENT_FAILURES reason (login wall, CAPTCHA,
+                # expired, ...), so the apply_attempts < max_apply_attempts
+                # clause below already excludes those -- only a job that failed
+                # for a transient reason, within its attempt budget, re-qualifies.
+                status_clause = "(apply_status = 'approved' OR apply_status = 'failed')"
                 order_clause = "fit_score DESC, url"
             row = conn.execute(f"""
                 SELECT url, title, company, site, application_url, tailored_resume_path,
@@ -1054,8 +1062,8 @@ def main(limit: int = 1, target_url: str | None = None,
 def _notify_run_results(run_start: str, console: Console) -> None:
     """Email a summary of anything from this run that needs human attention:
     CAPTCHA blocks (go solve these yourself), jobs ready for review (from a
-    --dry-run pass), and real applies. Scoped to this run via
-    last_attempted_at, which acquire_job() stamps when a job is claimed.
+    --dry-run pass), real applies, and outright failures. Scoped to this run
+    via last_attempted_at, which acquire_job() stamps when a job is claimed.
     Best-effort -- a notification failure should never crash the run that
     already completed."""
     try:
@@ -1074,16 +1082,18 @@ def _notify_run_results(run_start: str, console: Console) -> None:
         captcha_jobs = _fetch("captcha")
         reviewed_jobs = _fetch("pending_review", ", review_notes")
         applied_jobs = _fetch("applied")
+        failed_jobs = _fetch("failed", ", apply_error")
 
-        if not (captcha_jobs or reviewed_jobs or applied_jobs):
+        if not (captcha_jobs or reviewed_jobs or applied_jobs or failed_jobs):
             return
 
         from applypilot.notify.digest import send_apply_run_notification
-        result = send_apply_run_notification(captcha_jobs, reviewed_jobs, applied_jobs)
+        result = send_apply_run_notification(captcha_jobs, reviewed_jobs, applied_jobs, failed_jobs)
         if result.get("sent"):
             console.print(
                 f"[dim]Notified by email: {len(captcha_jobs)} captcha, "
-                f"{len(reviewed_jobs)} for review, {len(applied_jobs)} applied.[/dim]"
+                f"{len(reviewed_jobs)} for review, {len(applied_jobs)} applied, "
+                f"{len(failed_jobs)} failed.[/dim]"
             )
         elif result.get("error"):
             console.print(f"[yellow]Could not send apply notification email: {result['error']}[/yellow]")

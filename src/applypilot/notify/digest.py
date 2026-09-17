@@ -342,12 +342,21 @@ def send_daily_digest(min_score: int = 7, limit: int = 20) -> dict:
     return {"sent": 1, "jobs": len(jobs), "error": None}
 
 
+def _is_permanent_failure(reason: str) -> bool:
+    """Delegates to launcher's classification (the single source of truth --
+    it's what actually decides whether acquire_job() retries the job) so this
+    email's wording can never drift out of sync with what will really happen."""
+    from applypilot.apply.launcher import _is_permanent_failure as _classify
+    return _classify(reason)
+
+
 def send_apply_run_notification(
     captcha_jobs: list[dict], reviewed_jobs: list[dict], applied_jobs: list[dict],
+    failed_jobs: list[dict] | None = None,
 ) -> dict:
     """Email a summary right after an `applypilot apply` run, so CAPTCHA
-    blocks and review-ready applications don't sit silently in the database
-    until someone remembers to check.
+    blocks, review-ready applications, and outright failures don't sit
+    silently in the database until someone remembers to check.
 
     - captcha_jobs: blocked by an unsolvable CAPTCHA -- these need the user
       to go solve it by hand on the actual posting (CapSolver isn't
@@ -355,13 +364,19 @@ def send_apply_run_notification(
     - reviewed_jobs: a --dry-run pass filled the form and is waiting for
       --approve before any real submission (includes review_notes).
     - applied_jobs: a real (live) run actually submitted these.
+    - failed_jobs: approved, attempted, and failed outright (includes
+      apply_error) -- e.g. a login wall, an infra hiccup, an expired
+      posting. These previously went unreported: a run where nothing
+      succeeded and nothing hit CAPTCHA or review sent no email at all,
+      leaving a job you'd already approved in silent limbo.
 
-    Sends nothing if all three lists are empty.
+    Sends nothing if all four lists are empty.
 
     Returns:
         {"sent": 0 or 1, "error": str | None}
     """
-    if not (captcha_jobs or reviewed_jobs or applied_jobs):
+    failed_jobs = failed_jobs or []
+    if not (captcha_jobs or reviewed_jobs or applied_jobs or failed_jobs):
         return {"sent": 0, "error": None}
 
     load_env()
@@ -381,6 +396,8 @@ def send_apply_run_notification(
         parts.append(f"{len(reviewed_jobs)} ready for review")
     if applied_jobs:
         parts.append(f"{len(applied_jobs)} applied")
+    if failed_jobs:
+        parts.append(f"{len(failed_jobs)} failed")
     subject = f"ApplyPilot apply run: {', '.join(parts)} ({datetime.now().strftime('%Y-%m-%d %H:%M')})"
 
     lines: list[str] = []
@@ -416,6 +433,22 @@ def send_apply_run_notification(
         lines.append("")
         for j in applied_jobs:
             lines.append(f"[{j.get('fit_score', '?')}/10] {j['title']} -- {j.get('company') or j.get('site', 'Unknown')}")
+            lines.append(f"  Link: {j.get('application_url') or j['url']}")
+            lines.append("")
+
+    if failed_jobs:
+        lines.append(f"=== {len(failed_jobs)} job(s) you approved but could not be submitted ===")
+        lines.append("")
+        for j in failed_jobs:
+            reason = str(j.get("apply_error") or "unknown error")
+            hint = (
+                "needs you: this can't be retried automatically (login wall, CAPTCHA, "
+                "expired, or similar) -- go handle it on the posting directly"
+                if _is_permanent_failure(reason)
+                else "transient -- will be retried automatically on the next run"
+            )
+            lines.append(f"[{j.get('fit_score', '?')}/10] {j['title']} -- {j.get('company') or j.get('site', 'Unknown')}")
+            lines.append(f"  Reason: {reason} ({hint})")
             lines.append(f"  Link: {j.get('application_url') or j['url']}")
             lines.append("")
 
