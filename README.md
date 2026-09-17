@@ -24,9 +24,11 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ## What It Does
 
-ApplyPilot discovers jobs across 5+ boards and scores them against your resume with AI — but it **never tailors a CV, writes a cover letter, or submits an application on its own.** Every day it emails you one digest of new matches; nothing happens next until you reply with the numbers of the jobs you actually want to go for. Only then does it tailor a resume and cover letter for exactly those jobs and submit them, navigating forms, uploading documents, and answering screening questions hands-free.
+ApplyPilot runs in two phases:
 
-This is a single, explicit approval gate, not a two-step confirmation dance: naming a job in your reply is the only action that moves it from "matched" to "tailor and apply." A job you never name is never touched.
+**1. Discovery & Digest (automated, runs daily on its own).** Scrapes 5+ job boards, scores every posting against your resume with an LLM, and sends you one digest email with the matches. Nothing is written or submitted anywhere at this stage — it's read-only.
+
+**2. Human-in-the-loop (only after you reply).** You reply to the digest naming the job numbers you actually want. That reply is the trigger: `apply_status` for those jobs flips to `approved`, and only then does ApplyPilot generate a tailored CV and cover letter, drive a browser through the application form (uploads, screening questions, submit), and send you a confirmation email with the outcome. Jobs you didn't name stay untouched — no CV, no cover letter, no application.
 
 ```bash
 pip install applypilot
@@ -164,6 +166,22 @@ applypilot apply --mark-failed URL     # manually mark a job as failed
 applypilot apply --reset-failed        # reset all failed jobs for retry
 applypilot apply --gen --url URL       # generate prompt file for manual debugging
 ```
+
+---
+
+## Security & Guardrails
+
+The apply agent reads untrusted text (job postings) and drives a real browser with your real accounts, so it's scoped down on purpose:
+
+| Guardrail | What it does |
+|-----------|---------------|
+| **Approval gate** | Enforced in the SQL query itself (`acquire_job()`), not just in the prompt — a live run can only pick up jobs with `apply_status='approved'`, which is only ever set by your digest reply or an explicit `applypilot apply --approve`. |
+| **MCP scope isolation** | The apply agent runs with `--strict-mcp-config`, so it can only reach the two MCP servers it's actually given (Playwright + Gmail) — not whatever else happens to be configured on your machine (Notion, Calendar, Drive, etc). |
+| **No outbound email tool** | `mcp__gmail__send_email` and every other Gmail write/send tool is in `--disallowedTools`. An agent that reads arbitrary job-posting text should never also be able to send mail — that combination is a data-exfiltration path, so it's blocked outright rather than trusted to behave. |
+| **Stop-on-uncertainty** | CAPTCHAs and unfamiliar login walls make the agent stop and hand the job back to you instead of guessing or trying to work around them — see `RESULT:CAPTCHA` / `RESULT:FAILED:login_issue` in the transcripts. |
+| **Kill switch** | `Ctrl+C` once skips the job currently in progress; `Ctrl+C` twice kills every active Claude/Chrome process tree and stops the run immediately. |
+| **Dry-run mode** | `applypilot apply --dry-run` (or `applypilot daily --no-live-apply`) fills and screenshots forms without ever clicking submit, so you can see exactly what would be sent before it is. |
+| **Dependency pinning** | `requirements-lock.txt` pins exact versions of every production dependency, so `pip install` can't silently pull in a newer, unreviewed release. |
 
 ---
 
