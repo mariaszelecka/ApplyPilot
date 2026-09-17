@@ -39,20 +39,6 @@ applypilot poll          # run every ~15 min: check for a reply, tailor + submit
 
 ---
 
-## Two Paths
-
-### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
-
-Runs the whole approval-gated process end to end: discovery through autonomous submission of whatever you approved by email.
-
-### Discovery + Scoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
-
-Discovers jobs, scores them, and emails you the digest. Without Claude Code CLI/Chrome, nothing can be tailored or submitted even after you approve — this path is for browsing matches only.
-
----
-
 ## The Pipeline
 
 | Stage | What Happens |
