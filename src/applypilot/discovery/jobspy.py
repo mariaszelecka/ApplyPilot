@@ -22,6 +22,7 @@ from applypilot.scoring.scorer import (
     is_consulting_manager_title,
     is_graduate_program_title,
     is_senior_title,
+    is_ubs_internship_title,
 )
 
 log = logging.getLogger(__name__)
@@ -378,9 +379,9 @@ def _run_one_search(
 
     # Seniority/scheme prefilter: drop senior/lead/director-level LinkedIn
     # postings, "Manager"-titled postings at major consulting firms (a senior,
-    # experienced-hire grade there specifically), and university-graduate /
-    # graduate-talent-program postings (overqualified in the other direction
-    # -- see scorer.py for all three).
+    # experienced-hire grade there specifically), university-graduate /
+    # graduate-talent-program postings, and UBS internship postings
+    # (overqualified in the other direction -- see scorer.py for all four).
     before_senior = len(df)
     if "site" in df.columns:
         df = df[~df.apply(
@@ -389,6 +390,7 @@ def _run_one_search(
                 is_senior_title(str(row.get("title", "")))
                 or is_consulting_manager_title(str(row.get("title", "")), str(row.get("company", "")))
                 or is_graduate_program_title(str(row.get("title", "")))
+                or is_ubs_internship_title(str(row.get("title", "")), str(row.get("company", "")))
             ),
             axis=1,
         )]

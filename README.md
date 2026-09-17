@@ -6,7 +6,7 @@
 
 # ApplyPilot
 
-**Applied to 1,000 jobs in 2 days. Fully autonomous. Open source.**
+**Discovers and scores jobs autonomously. Tailors and applies only to what you approve. Open source.**
 
 [![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
@@ -24,21 +24,22 @@ https://github.com/user-attachments/assets/7ee3417f-43d4-4245-9952-35df1e77f2df
 
 ## What It Does
 
-ApplyPilot is a 6-stage autonomous job application pipeline. It discovers jobs across 5+ boards, scores them against your resume with AI, tailors your resume per job, writes cover letters, and **submits applications for you**. It navigates forms, uploads documents, answers screening questions, all hands-free.
+ApplyPilot discovers jobs across 5+ boards and scores them against your resume with AI — but it **never tailors a CV, writes a cover letter, or submits an application on its own.** Every day it emails you one digest of new matches; nothing happens next until you reply with the numbers of the jobs you actually want to go for. Only then does it tailor a resume and cover letter for exactly those jobs and submit them, navigating forms, uploading documents, and answering screening questions hands-free.
 
-Three commands. That's it.
+This is a single, explicit approval gate, not a two-step confirmation dance: naming a job in your reply is the only action that moves it from "matched" to "tailor and apply." A job you never name is never touched.
 
 ```bash
 pip install applypilot
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
-applypilot run           # discover > enrich > score > tailor > cover letters
-applypilot run -w 4      # same but parallel (4 threads for discovery/enrichment)
-applypilot apply         # autonomous browser-driven submission
-applypilot apply -w 3    # parallel apply (3 Chrome instances)
-applypilot apply --dry-run  # fill forms without submitting
+applypilot daily         # discover > score > email one digest — tailors/submits ONLY what you approved last time
+applypilot poll          # run every ~15 min: check for a reply, tailor + submit only the jobs you named
 ```
+
+> Reply to the digest email with the job numbers you want (e.g. "2, 5, 7" or "all"). `applypilot poll` (or the next `applypilot daily`) picks up the approval, tailors a CV + cover letter for exactly those jobs, and submits them.
+
+`applypilot run` and `applypilot apply` also exist as lower-level, manual commands for running individual stages or a specific URL by hand — see [CLI Reference](#cli-reference). They're useful for testing, but `daily` + `poll` are the actual approval-gated process described above.
 
 > **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
 
@@ -49,12 +50,12 @@ applypilot apply --dry-run  # fill forms without submitting
 ### Full Pipeline (recommended)
 **Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
 
-Runs all 6 stages, from job discovery to autonomous application submission. This is the full power of ApplyPilot.
+Runs the whole approval-gated process end to end: discovery through autonomous submission of whatever you approved by email.
 
-### Discovery + Tailoring Only
+### Discovery + Scoring Only
 **Requires:** Python 3.11+, Gemini API key (free)
 
-Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cover letters. You submit applications manually with the AI-prepared materials.
+Discovers jobs, scores them, and emails you the digest. Without Claude Code CLI/Chrome, nothing can be tailored or submitted even after you approve — this path is for browsing matches only.
 
 ---
 
@@ -64,12 +65,13 @@ Runs stages 1-5: discovers jobs, scores them, tailors your resume, generates cov
 |-------|-------------|
 | **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
-| **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs proceed |
-| **4. Tailor** | AI rewrites your resume per job: reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
-| **5. Cover Letter** | AI generates a targeted cover letter per job |
-| **6. Auto-Apply** | Claude Code navigates application forms, fills fields, uploads documents, answers questions, and submits |
+| **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs make the digest |
+| **4. Digest & Approve** | One email a day with every new match. **Nothing further happens until you reply** with the numbers of the jobs you want — that reply is the only approval ApplyPilot ever acts on |
+| **5. Tailor** | For jobs you named only: AI rewrites your resume per job — reorganizes, emphasizes relevant experience, adds keywords. Never fabricates |
+| **6. Cover Letter** | For jobs you named only: AI generates a targeted cover letter |
+| **7. Auto-Apply** | For jobs you named only: Claude Code navigates the application form, fills fields, uploads documents, answers questions, and submits |
 
-Each stage is independent. Run them all or pick what you need.
+Stages 1-3 run automatically every day regardless of approval — that's just discovery and scoring, nothing is sent anywhere external. Stages 5-7 run *only* for jobs you explicitly named in a digest reply; this is enforced at the database level (see [How Stages Work](#how-stages-work)), not just by prompt instructions.
 
 ---
 
@@ -137,18 +139,23 @@ Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrap
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
 
 ### Score
-AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold proceed to tailoring.
+AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 5-6 = moderate, 1-4 = skip. Only jobs above your threshold make the digest — nothing is tailored yet.
+
+### Digest & Approve
+`applypilot daily` emails you one digest listing every new match above your score threshold, numbered. You reply to that email with the numbers you want (e.g. "2, 5, 7" or "all"). That reply is read over IMAP and is the *only* thing that moves a job from "matched" to `apply_status='approved'` in the database — nothing is tailored or submitted for a job you didn't name, and this is enforced by the query that selects jobs for tailoring and submission, not just by instructing the AI to behave.
+
+Run `applypilot poll` on a short interval (every ~15 min) alongside the once-a-day `daily` job to act on a reply within minutes instead of waiting for tomorrow's run — it does no new discovery or scoring, only tailoring + submission for jobs you've already approved.
 
 ### Tailor
-Generates a custom resume per job: reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
+For every job you approved that doesn't have one yet: generates a custom resume, reorders experience, emphasizes relevant skills, incorporates keywords from the job description. Your `resume_facts` (companies, projects, metrics) are preserved exactly. The AI reorganizes but never fabricates.
 
 ### Cover Letter
-Writes a targeted cover letter per job referencing the specific company, role, and how your experience maps to their requirements.
+For the same approved jobs: writes a targeted cover letter referencing the specific company, role, and how your experience maps to their requirements.
 
 ### Auto-Apply
-Claude Code launches a Chrome instance, navigates to each application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time.
+For the same approved jobs: Claude Code launches a Chrome instance, navigates to the application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time. If a form hits a CAPTCHA or a login wall it doesn't have credentials for, it stops and hands the job back to you rather than guessing.
 
-The Playwright MCP server is configured automatically at runtime per worker. No manual MCP setup needed.
+The Playwright MCP server is configured automatically at runtime per worker, scoped so the agent can only reach that server and nothing else on your machine. No manual MCP setup needed.
 
 ```bash
 # Utility modes (no Chrome/Claude needed)
@@ -165,14 +172,23 @@ applypilot apply --gen --url URL       # generate prompt file for manual debuggi
 ```
 applypilot init                         # First-time setup wizard
 applypilot doctor                       # Verify setup, diagnose missing requirements
-applypilot run [stages...]              # Run pipeline stages (or 'all')
+applypilot daily                        # THE main command: discover > score > digest email,
+                                         #   then tailor + cover letter + submit whatever you
+                                         #   approved by replying to the previous digest
+applypilot daily --no-email             # Same, but skip sending the digest (still applies approvals)
+applypilot daily --no-live-apply        # Tailor approved jobs but don't submit yet
+applypilot poll                         # Check for a digest reply and act on it now, without
+                                         #   waiting for tomorrow's daily run (no discovery/scoring)
+applypilot poll --no-apply              # Tailor newly-approved jobs but don't submit
+applypilot run [stages...]              # Manual/testing: run pipeline stages directly (or 'all'),
+                                         #   bypassing the digest-approval gate for tailoring
 applypilot run --workers 4              # Parallel discovery/enrichment
 applypilot run --stream                 # Concurrent stages (streaming mode)
 applypilot run --min-score 8            # Override score threshold
 applypilot run --dry-run                # Preview without executing
 applypilot run --validation lenient     # Relax validation (recommended for Gemini free tier)
 applypilot run --validation strict      # Strictest validation (retries on any banned word)
-applypilot apply                        # Launch auto-apply
+applypilot apply                        # Launch auto-apply (only ever submits apply_status='approved' jobs)
 applypilot apply --workers 3            # Parallel browser workers
 applypilot apply --dry-run              # Fill forms without submitting
 applypilot apply --continuous           # Run forever, polling for new jobs
@@ -182,11 +198,7 @@ applypilot status                       # Pipeline statistics
 applypilot dashboard                    # Open HTML results dashboard
 ```
 
----
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, coding standards, and PR guidelines.
+> `applypilot run`'s `tailor`/`cover` stages work directly off the score threshold and are **not** gated by a digest reply — they're a manual/debugging primitive, not the approval flow. Submission (`applypilot apply`) is gated regardless of how a job got tailored: it only ever submits jobs with `apply_status='approved'`, and that status is set only by a digest reply or an explicit `applypilot apply --approve`.
 
 ---
 

@@ -325,6 +325,23 @@ def is_consulting_manager_title(title: str | None, company: str | None) -> bool:
     return bool(_MANAGER_WORD_PATTERN.search(title or ""))
 
 
+# UBS grades its own internships as an early-career pipeline the same way it
+# grades its graduate program (same overqualification concern as
+# is_graduate_program_title -- 6 years' experience, two Master's degrees).
+# Scoped to UBS specifically, not internships generally: other employers'
+# internship postings are still legitimate matches.
+_INTERNSHIP_PATTERN = re.compile(r"\bintern(?:ship)?\b", re.IGNORECASE)
+_UBS_PATTERN = re.compile(r"\bubs\b", re.IGNORECASE)
+
+
+def is_ubs_internship_title(title: str | None, company: str | None) -> bool:
+    """Is this an internship posting at UBS specifically? Shared with
+    discovery/jobspy.py's LinkedIn-only prefilter."""
+    if not company or not _UBS_PATTERN.search(company):
+        return False
+    return bool(_INTERNSHIP_PATTERN.search(title or ""))
+
+
 # Explicit "you must hand-write code" phrasing. The candidate's only real
 # programming language is R (see skills_boundary.programming_languages) --
 # none of these phrases ever legitimately describe an R requirement in
@@ -396,6 +413,9 @@ def score_job(resume_text: str, job: dict) -> dict:
 
     if is_consulting_manager_title(job.get("title"), job.get("company")):
         return {"score": 1, "keywords": "", "reasoning": f"Excluded: 'Manager' title at {job.get('company')} denotes a senior, experienced-hire grade at major consulting firms, candidate is targeting entry-level roles"}
+
+    if is_ubs_internship_title(job.get("title"), job.get("company")):
+        return {"score": 1, "keywords": "", "reasoning": "Excluded: UBS internship -- candidate has 6 years' experience and two Master's degrees, overqualified for an early-career internship"}
 
     region_rule_text = _build_region_rule_text(job, region_rules)
     programming_languages = profile.get("skills_boundary", {}).get("programming_languages", [])
