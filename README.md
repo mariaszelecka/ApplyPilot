@@ -55,19 +55,6 @@ Stages 1-3 run automatically every day regardless of approval — that's just di
 
 ---
 
-## ApplyPilot vs The Alternatives
-
-| Feature | ApplyPilot | AIHawk | Manual |
-|---------|-----------|--------|--------|
-| Job discovery | 5 boards + Workday + direct sites | LinkedIn only | One board at a time |
-| AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
-| Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
-| Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
-| License | AGPL-3.0 | MIT | N/A |
-
----
-
 ## Requirements
 
 | Component | Required For | Details |
