@@ -57,7 +57,7 @@ Discovers jobs, scores them, and emails you the digest. Without Claude Code CLI/
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 48 Workday employer portals + 30 direct career sites |
+| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 8 Workday employer portals (Swiss/DACH-focused) + 30 direct career sites |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs make the digest |
 | **4. Digest & Approve** | One email a day with every new match. **Nothing further happens until you reply** with the numbers of the jobs you want — that reply is the only approval ApplyPilot ever acts on |
@@ -77,7 +77,7 @@ Stages 1-3 run automatically every day regardless of approval — that's just di
 | AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
 | Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
 | Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 46 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
+| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 8 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
 | License | AGPL-3.0 | MIT | N/A |
 
 ---
@@ -118,7 +118,7 @@ Job search queries, target titles, locations, boards. Run multiple searches with
 API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` (optional).
 
 ### Package configs (shipped with ApplyPilot)
-- `config/employers.yaml` - Workday employer registry (48 preconfigured)
+- `config/employers.yaml` - Workday employer registry (8 preconfigured, Swiss/DACH-focused -- swap in your own region's employers if targeting elsewhere)
 - `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains
 - `config/searches.example.yaml` - Example search configuration
 
@@ -127,7 +127,7 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` 
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 48 Workday employer portals (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
+Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 8 Workday employer portals, Swiss/DACH-focused (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
 
 ### Enrich
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
