@@ -39,20 +39,6 @@ applypilot poll          # run every ~15 min: check for a reply, tailor + submit
 
 ---
 
-## Two Paths
-
-### Full Pipeline (recommended)
-**Requires:** Python 3.11+, Node.js (for npx), Gemini API key (free), Claude Code CLI, Chrome
-
-Runs the whole approval-gated process end to end: discovery through autonomous submission of whatever you approved by email.
-
-### Discovery + Scoring Only
-**Requires:** Python 3.11+, Gemini API key (free)
-
-Discovers jobs, scores them, and emails you the digest. Without Claude Code CLI/Chrome, nothing can be tailored or submitted even after you approve — this path is for browsing matches only.
-
----
-
 ## The Pipeline
 
 | Stage | What Happens |
@@ -66,19 +52,6 @@ Discovers jobs, scores them, and emails you the digest. Without Claude Code CLI/
 | **7. Auto-Apply** | For jobs you named only: Claude Code navigates the application form, fills fields, uploads documents, answers questions, and submits |
 
 Stages 1-3 run automatically every day regardless of approval — that's just discovery and scoring, nothing is sent anywhere external. Stages 5-7 run *only* for jobs you explicitly named in a digest reply; this is enforced at the database level (see [How Stages Work](#how-stages-work)), not just by prompt instructions.
-
----
-
-## ApplyPilot vs The Alternatives
-
-| Feature | ApplyPilot | AIHawk | Manual |
-|---------|-----------|--------|--------|
-| Job discovery | 5 boards + Workday + direct sites | LinkedIn only | One board at a time |
-| AI scoring | 1-10 fit score per job | Basic filtering | Your gut feeling |
-| Resume tailoring | Per-job AI rewrite | Template-based | Hours per application |
-| Auto-apply | Full form navigation + submission | LinkedIn Easy Apply only | Click, type, repeat |
-| Supported sites | Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs, 8 Workday portals, 28 direct sites | LinkedIn | Whatever you open |
-| License | AGPL-3.0 | MIT | N/A |
 
 ---
 
@@ -168,10 +141,10 @@ The apply agent reads untrusted text (job postings) and drives a real browser wi
 | Guardrail | What it does |
 |-----------|---------------|
 | **Approval gate** | Enforced in the SQL query itself (`acquire_job()`), not just in the prompt — a live run can only pick up jobs with `apply_status='approved'`, which is only ever set by your digest reply or an explicit `applypilot apply --approve`. |
-| **MCP scope isolation** | The apply agent runs with `--strict-mcp-config`, so it can only reach the two MCP servers it's actually given (Playwright + Gmail) — not whatever else happens to be configured on your machine (Notion, Calendar, Drive, etc). |
+| **MCP scope isolation** | The apply agent runs with `--strict-mcp-config`, so it can only reach the two MCP servers it's actually given (Playwright + Gmail)|
 | **No outbound email tool** | `mcp__gmail__send_email` and every other Gmail write/send tool is in `--disallowedTools`. An agent that reads arbitrary job-posting text should never also be able to send mail — that combination is a data-exfiltration path, so it's blocked outright rather than trusted to behave. |
-| **Stop-on-uncertainty** | CAPTCHAs and unfamiliar login walls make the agent stop and hand the job back to you instead of guessing or trying to work around them — see `RESULT:CAPTCHA` / `RESULT:FAILED:login_issue` in the transcripts. |
-| **Kill switch** | `Ctrl+C` once skips the job currently in progress; `Ctrl+C` twice kills every active Claude/Chrome process tree and stops the run immediately. |
+| **Stop-on-uncertainty** | CAPTCHAs and unfamiliar login walls make the agent stop and hand the job back to you instead of guessing — see `RESULT:CAPTCHA` / `RESULT:FAILED:login_issue` in the transcripts. |
+| **Kill switch** | `Ctrl+C` twice kills every active Claude/Chrome process tree and stops the run immediately. |
 | **Dry-run mode** | `applypilot apply --dry-run` (or `applypilot daily --no-live-apply`) fills and screenshots forms without ever clicking submit, so you can see exactly what would be sent before it is. |
 | **Dependency pinning** | `requirements-lock.txt` pins exact versions of every production dependency, so `pip install` can't silently pull in a newer, unreviewed release. |
 
