@@ -19,7 +19,7 @@ ApplyPilot runs in two phases:
 
 **1. Discovery & Digest (automated, runs daily on its own).** Scrapes 5+ job boards, scores every posting against your resume with an LLM, and sends you one digest email with the matches. Nothing is written or submitted anywhere at this stage — it's read-only.
 
-**2. Human-in-the-loop (only after you reply).** You reply to the digest naming the job numbers you actually want. That reply is the trigger: `apply_status` for those jobs flips to `approved`, and only then does ApplyPilot generate a tailored CV and cover letter, drive a browser through the application form (uploads, screening questions, submit), and send you a confirmation email with the outcome. Jobs you didn't name stay untouched — no CV, no cover letter, no application.
+**2. Human-in-the-loop (only after you reply).** You reply to the digest naming the job numbers you actually want. That reply is the trigger: `apply_status` for those jobs flips to `approved`, and only then does ApplyPilot generate a tailored CV and cover letter, drive a browser through the application form (uploads, screening questions, submit), and email you a summary of what happened. Jobs you didn't name stay untouched — no CV, no cover letter, no application.
 
 ```bash
 git clone https://github.com/mariaszelecka/ApplyPilot.git
@@ -114,6 +114,8 @@ AI scores every job 1-10 against your profile. 9-10 = strong match, 7-8 = good, 
 ### Digest & Approve
 `applypilot daily` emails you one digest listing every new match above your score threshold, numbered. You reply to that email with the numbers you want (e.g. "2, 5, 7" or "all"). That reply is read over IMAP and is the *only* thing that moves a job from "matched" to `apply_status='approved'` in the database — nothing is tailored or submitted for a job you didn't name, and this is enforced by the query that selects jobs for tailoring and submission, not just by instructing the AI to behave.
 
+The digest is sent as HTML (with a plain-text fallback), subject `ApplyPilot: N job match(es) ready for review (YYYY-MM-DD)`. It's only sent once a day, and only if there's something new to show -- an empty day sends nothing.
+
 Run `applypilot poll` on a short interval (every ~15 min) alongside the once-a-day `daily` job to act on a reply within minutes instead of waiting for tomorrow's run — it does no new discovery or scoring, only tailoring + submission for jobs you've already approved.
 
 ### Tailor
@@ -126,6 +128,8 @@ For the same approved jobs: writes a targeted cover letter referencing the speci
 For the same approved jobs: Claude Code launches a Chrome instance, navigates to the application page, detects the form type, fills personal information and work history, uploads the tailored resume and cover letter, answers screening questions with AI, and submits. A live dashboard shows progress in real-time. If a form hits a CAPTCHA or a login wall it doesn't have credentials for, it stops and hands the job back to you rather than guessing.
 
 The Playwright MCP server is configured automatically at runtime per worker, scoped so the agent can only reach that server and nothing else on your machine. No manual MCP setup needed.
+
+Every apply run -- `applypilot apply`, `daily`'s review/submit stages, and each `applypilot poll` tick that actually processed something -- ends by emailing a plain-text summary (subject `ApplyPilot apply run: ...`) of what happened: CAPTCHA blocks that need solving by hand, dry-run previews waiting on `--approve`, and jobs actually submitted. A run that changed nothing sends no email.
 
 ```bash
 # Utility modes (no Chrome/Claude needed)
