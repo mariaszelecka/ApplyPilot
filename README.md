@@ -129,7 +129,7 @@ For the same approved jobs: Claude Code launches a Chrome instance, navigates to
 
 The Playwright MCP server is configured automatically at runtime per worker, scoped so the agent can only reach that server and nothing else on your machine. No manual MCP setup needed.
 
-Every apply run -- `applypilot apply`, `daily`'s review/submit stages, and each `applypilot poll` tick that actually processed something -- ends by emailing a plain-text summary (subject `ApplyPilot apply run: ...`) of what happened: CAPTCHA blocks that need solving by hand, dry-run previews waiting on `--approve`, and jobs actually submitted. A run that changed nothing sends no email.
+Every apply run -- `applypilot apply`, `daily`'s review/submit stages, and each `applypilot poll` tick that actually processed something -- ends by emailing a summary (subject `ApplyPilot apply run: ...`), HTML with a plain-text fallback, same visual style as the digest. One card per job: green for actually submitted, red for anything that needs you (CAPTCHA, a dry-run preview waiting on `--approve`, or an outright failure -- with why it failed and whether it'll be retried automatically or needs you to step in). Applied and failed jobs get their tailored CV + cover letter attached as PDFs. A run that changed nothing sends no email. A job that fails for a transient reason (an infra hiccup, not a login wall or CAPTCHA) is automatically retried on the next run, up to 3 attempts, before it's left for you.
 
 ```bash
 # Utility modes (no Chrome/Claude needed)

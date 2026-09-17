@@ -166,6 +166,34 @@ _C_MUTED = "#6F6F8C"
 _C_ACCENT = "#4F51D8"
 _C_PILL_BG = "#EDECFC"
 
+# Apply-run status colours: green = submitted, red = needs you (CAPTCHA,
+# pending review, or an outright failure).
+_C_GOOD = "#1F8A4C"
+_C_GOOD_BG = "#E6F4EA"
+_C_BAD = "#C23934"
+_C_BAD_BG = "#FBEAEA"
+
+
+def _pdf_for(txt_path):
+    """The .pdf sibling of a stored .txt document path, if it was generated."""
+    if not txt_path:
+        return None
+    from pathlib import Path
+    pdf = Path(txt_path).with_suffix(".pdf")
+    return pdf if pdf.exists() else None
+
+
+def _attach_pdf(msg, path, label: str) -> bool:
+    from email.mime.application import MIMEApplication
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    part = MIMEApplication(data, _subtype="pdf")
+    part.add_header("Content-Disposition", "attachment", filename=f"{label}_{path.name}")
+    msg.attach(part)
+    return True
+
 
 def _build_email_body_html(jobs: list[dict]) -> str:
     plural = "es" if len(jobs) != 1 else ""
@@ -248,6 +276,92 @@ def _build_email_body_html(jobs: list[dict]) -> str:
     P.append(
         f'<tr><td style="padding:6px 12px 0 12px;font-family:Segoe UI,Helvetica,Arial,sans-serif;'
         f'font-size:12px;color:{_C_MUTED};">ApplyPilot</div></td></tr>'
+    )
+    P.append('</table></td></tr></table></div>')
+    return "".join(P)
+
+
+def _build_apply_run_html(
+    captcha_jobs: list[dict], reviewed_jobs: list[dict],
+    applied_jobs: list[dict], failed_jobs: list[dict],
+) -> str:
+    """Same visual language as the digest email (lavender ground, white
+    cards) but minimal per card -- a status pill, title/company, and a link.
+    Green for a job that actually got submitted; red for anything that
+    needs you (CAPTCHA, awaiting your approval, or an outright failure)."""
+    needs_you = len(captcha_jobs) + len(reviewed_jobs) + len(failed_jobs)
+    P = [
+        f'<div style="margin:0;padding:0;background-color:{_C_GROUND};">'
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"'
+        f' style="background-color:{_C_GROUND};padding:28px 12px;">'
+        f'<tr><td align="center">'
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"'
+        f' style="max-width:640px;width:100%;">'
+        f'<tr><td style="padding:8px 12px 22px 12px;">'
+        f'<div style="font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:34px;'
+        f'font-weight:300;letter-spacing:-0.5px;color:{_C_ACCENT};line-height:1.15;">Apply run</div>'
+        f'<div style="font-family:Segoe UI,Helvetica,Arial,sans-serif;font-size:15px;'
+        f'color:{_C_MUTED};padding-top:8px;line-height:1.55;">'
+        f'<span style="color:{_C_GOOD};font-weight:600;">{len(applied_jobs)} applied</span>'
+        f' &middot; <span style="color:{_C_BAD};font-weight:600;">{needs_you} need you</span>'
+        f'</div></td></tr>'
+    ]
+
+    def card(j: dict, tone: str, label: str, extra: str = "") -> str:
+        colour = _C_GOOD if tone == "good" else _C_BAD
+        pill_bg = _C_GOOD_BG if tone == "good" else _C_BAD_BG
+        title = escape(str(j.get("title") or "Untitled"))
+        company = escape(str(j.get("company") or j.get("site") or "Unknown"))
+        link = escape(str(j.get("application_url") or j.get("url") or ""), quote=True)
+        return (
+            f'<tr><td style="padding:0 0 12px 0;">'
+            f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"'
+            f' style="background-color:{_C_CARD};border-radius:16px;border-left:4px solid {colour};">'
+            f'<tr><td style="padding:18px 22px;font-family:Segoe UI,Helvetica,Arial,sans-serif;">'
+            f'<span style="display:inline-block;background-color:{pill_bg};color:{colour};'
+            f'font-size:12px;font-weight:600;padding:3px 10px;border-radius:20px;">{escape(label)}</span>'
+            f'<div style="font-size:17px;font-weight:600;color:{_C_INK};padding-top:8px;line-height:1.3;">{title}</div>'
+            f'<div style="font-size:14px;color:{_C_ACCENT};padding-top:2px;">{company}</div>'
+            f'{extra}'
+            f'<div style="padding-top:10px;">'
+            f'<a href="{link}" style="font-size:13px;color:{_C_ACCENT};text-decoration:none;'
+            f'font-weight:600;">Open posting &rsaquo;</a></div>'
+            f'</td></tr></table></td></tr>'
+        )
+
+    for j in applied_jobs:
+        P.append(card(j, "good", "Applied"))
+
+    for j in captcha_jobs:
+        extra = (
+            f'<div style="font-size:13px;color:{_C_INK};padding-top:8px;line-height:1.5;">'
+            f'Blocked by CAPTCHA &mdash; open the link and finish it yourself.</div>'
+        )
+        P.append(card(j, "bad", "CAPTCHA", extra))
+
+    for j in reviewed_jobs:
+        extra = (
+            f'<div style="font-size:13px;color:{_C_INK};padding-top:8px;line-height:1.5;">'
+            f'Filled and waiting for your approval &mdash; reply with its number to submit for real.</div>'
+        )
+        P.append(card(j, "bad", "Ready for review", extra))
+
+    for j in failed_jobs:
+        reason = str(j.get("apply_error") or "unknown error")
+        what_to_do = (
+            "Needs you -- go finish it on the posting directly."
+            if _is_permanent_failure(reason)
+            else "Will be retried automatically."
+        )
+        extra = (
+            f'<div style="font-size:13px;color:{_C_INK};padding-top:8px;line-height:1.5;">'
+            f'<b>Why:</b> {escape(reason)}<br><b>What to do:</b> {escape(what_to_do)}</div>'
+        )
+        P.append(card(j, "bad", "Failed", extra))
+
+    P.append(
+        f'<tr><td style="padding:6px 12px 0 12px;font-family:Segoe UI,Helvetica,Arial,sans-serif;'
+        f'font-size:12px;color:{_C_MUTED};">ApplyPilot</td></tr>'
     )
     P.append('</table></td></tr></table></div>')
     return "".join(P)
@@ -456,7 +570,26 @@ def send_apply_run_notification(
     msg["From"] = gmail_address
     msg["To"] = recipient
     msg["Subject"] = subject
-    msg.attach(MIMEText("\n".join(lines), "plain"))
+
+    alt = MIMEMultipart("alternative")
+    alt.attach(MIMEText("\n".join(lines), "plain"))
+    alt.attach(MIMEText(
+        _build_apply_run_html(captcha_jobs, reviewed_jobs, applied_jobs, failed_jobs), "html",
+    ))
+    msg.attach(alt)
+
+    # CV + cover letter attached for applied and failed jobs -- the ones
+    # where you might actually need the documents in hand (to double-check
+    # what got submitted, or to finish a failed one by hand).
+    attached = 0
+    for j in applied_jobs + failed_jobs:
+        tag = re.sub(r"[^\w-]", "_", str(j.get("company") or "job"))[:24]
+        cv = _pdf_for(j.get("tailored_resume_path"))
+        cl = _pdf_for(j.get("cover_letter_path"))
+        if cv and _attach_pdf(msg, cv, f"CV_{tag}"):
+            attached += 1
+        if cl and _attach_pdf(msg, cl, f"Letter_{tag}"):
+            attached += 1
 
     try:
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
@@ -467,8 +600,10 @@ def send_apply_run_notification(
         log.error("Apply notification: failed to send email: %s", e)
         return {"sent": 0, "error": str(e)}
 
-    log.info("Apply notification sent to %s: %d captcha, %d reviewed, %d applied",
-              recipient, len(captcha_jobs), len(reviewed_jobs), len(applied_jobs))
+    log.info("Apply notification sent to %s: %d captcha, %d reviewed, %d applied, "
+              "%d failed, %d attachments",
+              recipient, len(captcha_jobs), len(reviewed_jobs), len(applied_jobs),
+              len(failed_jobs), attached)
     return {"sent": 1, "error": None}
 
 

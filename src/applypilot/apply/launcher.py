@@ -1081,8 +1081,8 @@ def _notify_run_results(run_start: str, console: Console) -> None:
 
         captcha_jobs = _fetch("captcha")
         reviewed_jobs = _fetch("pending_review", ", review_notes")
-        applied_jobs = _fetch("applied")
-        failed_jobs = _fetch("failed", ", apply_error")
+        applied_jobs = _fetch("applied", ", tailored_resume_path, cover_letter_path")
+        failed_jobs = _fetch("failed", ", apply_error, tailored_resume_path, cover_letter_path")
 
         if not (captcha_jobs or reviewed_jobs or applied_jobs or failed_jobs):
             return
