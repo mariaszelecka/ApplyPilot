@@ -8,7 +8,6 @@
 
 **Discovers and scores jobs autonomously. Tailors and applies only to what you approve. Open source.**
 
-[![PyPI version](https://img.shields.io/pypi/v/applypilot?color=blue)](https://pypi.org/project/applypilot/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: AGPL-3.0](https://img.shields.io/badge/license-AGPL--3.0-green.svg)](LICENSE)
 
@@ -23,7 +22,9 @@ ApplyPilot runs in two phases:
 **2. Human-in-the-loop (only after you reply).** You reply to the digest naming the job numbers you actually want. That reply is the trigger: `apply_status` for those jobs flips to `approved`, and only then does ApplyPilot generate a tailored CV and cover letter, drive a browser through the application form (uploads, screening questions, submit), and send you a confirmation email with the outcome. Jobs you didn't name stay untouched — no CV, no cover letter, no application.
 
 ```bash
-pip install applypilot
+git clone https://github.com/mariaszelecka/ApplyPilot.git
+cd ApplyPilot
+pip install -e .
 pip install --no-deps python-jobspy && pip install pydantic tls-client requests markdownify regex
 applypilot init          # one-time setup: resume, profile, preferences, API keys
 applypilot doctor        # verify your setup — shows what's installed and what's missing
@@ -31,11 +32,13 @@ applypilot daily         # discover > score > email one digest — tailors/submi
 applypilot poll          # run every ~15 min: check for a reply, tailor + submit only the jobs you named
 ```
 
+> This fork isn't published to PyPI -- it's meant to be cloned and run from source (`pip install -e .` installs it editable, so `applypilot` on your PATH always reflects the checked-out code).
+
 > Reply to the digest email with the job numbers you want (e.g. "2, 5, 7" or "all"). `applypilot poll` (or the next `applypilot daily`) picks up the approval, tailors a CV + cover letter for exactly those jobs, and submits them.
 
 `applypilot run` and `applypilot apply` also exist as lower-level, manual commands for running individual stages or a specific URL by hand — see [CLI Reference](#cli-reference). They're useful for testing, but `daily` + `poll` are the actual approval-gated process described above.
 
-> **Why two install commands?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the second command installs jobspy's actual runtime dependencies. Everything except `python-jobspy` installs normally.
+> **Why the separate jobspy install?** `python-jobspy` pins an exact numpy version in its metadata that conflicts with pip's resolver, but works fine at runtime with any modern numpy. The `--no-deps` flag bypasses the resolver; the following command installs jobspy's actual runtime dependencies. Everything else installs normally via `pip install -e .`.
 
 ---
 
