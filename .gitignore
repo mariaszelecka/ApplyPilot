@@ -39,6 +39,7 @@ __pycache__/
 dist/
 build/
 *.egg
+.pytest_cache/
 
 # IDE
 .vscode/
