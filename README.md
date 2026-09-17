@@ -43,7 +43,7 @@ applypilot poll          # run every ~15 min: check for a reply, tailor + submit
 
 | Stage | What Happens |
 |-------|-------------|
-| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 8 Workday employer portals (Swiss/DACH-focused) + 30 direct career sites |
+| **1. Discover** | Scrapes 5 job boards (Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs) + 8 Workday employer portals (Swiss/DACH-focused). Direct career sites are supported (`sites.yaml`) but empty by default -- add your own |
 | **2. Enrich** | Fetches full job descriptions via JSON-LD, CSS selectors, or AI-powered extraction |
 | **3. Score** | AI rates every job 1-10 based on your resume and preferences. Only high-fit jobs make the digest |
 | **4. Digest & Approve** | One email a day with every new match. **Nothing further happens until you reply** with the numbers of the jobs you want — that reply is the only approval ApplyPilot ever acts on |
@@ -92,7 +92,7 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` 
 
 ### Package configs (shipped with ApplyPilot)
 - `config/employers.yaml` - Workday employer registry (8 preconfigured, Swiss/DACH-focused -- swap in your own region's employers if targeting elsewhere)
-- `config/sites.yaml` - Direct career sites (30+), blocked sites, base URLs, manual ATS domains
+- `config/sites.yaml` - Direct career sites (empty by default -- add your own), blocked sites, base URLs, manual ATS domains
 - `config/searches.example.yaml` - Example search configuration
 
 ---
@@ -100,7 +100,7 @@ API keys and runtime config: `GEMINI_API_KEY`, `LLM_MODEL`, `CAPSOLVER_API_KEY` 
 ## How Stages Work
 
 ### Discover
-Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 8 Workday employer portals, Swiss/DACH-focused (configurable in `employers.yaml`). Hits 30 direct career sites with custom extractors. Deduplicates by URL.
+Queries Indeed, LinkedIn, Glassdoor, ZipRecruiter, Google Jobs via JobSpy. Scrapes 8 Workday employer portals, Swiss/DACH-focused (configurable in `employers.yaml`). Direct-site scraping (`sites.yaml`) is supported but ships empty -- the original list was all software-engineer-role US/Canada boards, irrelevant here; add your own if useful. Deduplicates by URL.
 
 ### Enrich
 Visits each job URL and extracts the full description. 3-tier cascade: JSON-LD structured data, then CSS selector patterns, then AI-powered extraction for unknown layouts.
