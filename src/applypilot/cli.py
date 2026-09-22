@@ -413,6 +413,14 @@ def poll(
     # Never run while a daily run is active -- they would contend for the DB and,
     # worse, drive two Chrome/apply stages at once. Own lock, plus a check on
     # daily's. A lock whose PID is gone is stale and gets taken over.
+    #
+    # A live PID alone isn't enough: Windows recycles PIDs, and a lock whose
+    # PID has since been reused by an unrelated process reads as "still
+    # running" forever, silently skipping every run until the machine
+    # reboots. Hit in practice -- daily.lock kept a stale PID that got
+    # reassigned to a WMI helper process two days later, and every poll
+    # tick that day saw it as live and skipped itself. Confirm the PID is
+    # actually a python.exe process before trusting it.
     def _stale(lock_path) -> bool:
         if not lock_path.exists():
             return True
@@ -426,7 +434,17 @@ def poll(
             os.kill(pid, 0)
         except OSError:
             return True
-        return False
+        try:
+            import subprocess
+            result = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            return "python.exe" not in result.stdout.lower()
+        except Exception:
+            # Identity check itself failed -- fall back to the PID-alive
+            # result rather than blocking indefinitely on a tooling failure.
+            return False
 
     daily_lock = APP_DIR / "daily.lock"
     poll_lock = APP_DIR / "poll.lock"
